@@ -126,6 +126,17 @@ class Idefics3Processor(ProcessorMixin):
             value the model used. It is computed as: image_seq_len = int(((image_size // patch_size) ** 2) / (scale_factor**2))
         chat_template (`str`, *optional*): A Jinja template which will be used to convert lists of messages
             in a chat into a tokenizable string.
+        fake_image_token (`str` or `AddedToken`, *optional*, defaults to "<fake_token_around_image>"):
+            Token used to wrap expanded image sequences. Override to use a custom token.
+        image_token (`str` or `AddedToken`, *optional*, defaults to "<image>"):
+            Token in the text prompt indicating where image patches should be inserted.
+        end_of_utterance_token (`str` or `AddedToken`, *optional*, defaults to "<end_of_utterance>"):
+            Token inserted between user and assistant turns. Override to match a custom tokenizer vocabulary.
+        global_image_tag (`str` or `AddedToken`, *optional*, defaults to "<global-img>"):
+            Token corresponding to the global image representation.
+        extra_special_tokens_pattern (`str`, *optional*):
+            Regular expression pattern used to strip redundant special tokens when preparing chat prompts. By default
+            this pattern is derived from the configured `global_image_tag`.
     """
 
     attributes = ["image_processor", "tokenizer"]

@@ -34,6 +34,11 @@ from ...utils.output_capturing import capture_outputs
 from ..auto import AutoModel
 from .configuration_idefics3 import Idefics3Config, Idefics3VisionConfig
 
+try:
+    from ..granitemoehybrid.modeling_granitemoehybrid import HybridMambaAttentionDynamicCache
+except ImportError:
+    HybridMambaAttentionDynamicCache = None
+
 
 logger = logging.get_logger(__name__)
 
@@ -667,9 +672,6 @@ class Idefics3Model(Idefics3PreTrainedModel):
         else:
             raise ValueError("You have to specify either input_ids or inputs_embeds")
 
-        if use_cache and past_key_values is None:
-            past_key_values = DynamicCache(config=self.config)
-
         if inputs_embeds is None:
             inputs_embeds = self.text_model.get_input_embeddings()(input_ids).to(self.device)
 
@@ -691,6 +693,23 @@ class Idefics3Model(Idefics3PreTrainedModel):
                 inputs_embeds=inputs_embeds,
                 image_hidden_states=image_hidden_states,
             )
+
+        text_model_type = getattr(self.text_model.config, "model_type", None)
+        if use_cache:
+            if text_model_type == "granitemoehybrid":
+                if HybridMambaAttentionDynamicCache is None:
+                    raise ImportError(
+                        "HybridMambaAttentionDynamicCache is unavailable but required when using a GraniteMoeHybrid text model."
+                    )
+                if not isinstance(past_key_values, HybridMambaAttentionDynamicCache):
+                    past_key_values = HybridMambaAttentionDynamicCache(
+                        self.text_model.config,
+                        batch_size=batch_size,
+                        dtype=inputs_embeds.dtype,
+                        device=inputs_embeds.device,
+                    )
+            elif past_key_values is None:
+                past_key_values = DynamicCache(config=self.config)
 
         outputs = self.text_model(
             inputs_embeds=inputs_embeds,
@@ -902,7 +921,48 @@ class Idefics3ForConditionalGeneration(Idefics3PreTrainedModel, GenerationMixin)
             **kwargs,
         )
 
-        if image_hidden_states is not None or (use_cache and not is_first_iteration):
+        text_model_type = getattr(self.model.text_model.config, "model_type", None)
+        if (
+            model_inputs.get("use_cache", True)
+            and text_model_type == "granitemoehybrid"
+            and not isinstance(model_inputs.get("past_key_values"), HybridMambaAttentionDynamicCache)
+        ):
+            if HybridMambaAttentionDynamicCache is None:
+                raise ImportError(
+                    "HybridMambaAttentionDynamicCache is unavailable but required when using a GraniteMoeHybrid text model."
+                )
+
+            cache_source = model_inputs.get("inputs_embeds")
+            if cache_source is None:
+                cache_source = model_inputs.get("decoder_inputs_embeds")
+            if cache_source is not None:
+                batch_size = cache_source.shape[0]
+                dtype = cache_source.dtype
+                device = cache_source.device
+            else:
+                input_tensor = model_inputs.get("input_ids")
+                if input_tensor is None:
+                    input_tensor = model_inputs.get("decoder_input_ids")
+                if input_tensor is None:
+                    input_tensor = input_ids
+                if input_tensor is None:
+                    raise ValueError("Unable to determine batch size for GraniteMoeHybrid cache initialization.")
+                batch_size = input_tensor.shape[0]
+                dtype = self.model.text_model.get_input_embeddings().weight.dtype
+                device = input_tensor.device
+
+            model_inputs["past_key_values"] = HybridMambaAttentionDynamicCache(
+                self.model.text_model.config,
+                batch_size=batch_size,
+                dtype=dtype,
+                device=device,
+            )
+
+        cache_position = model_inputs.get("cache_position")
+        if cache_position is None:
+            cache_position = torch.zeros(1, dtype=torch.long, device=self.device)
+
+        if image_hidden_states is not None or cache_position[0] != 0:
             model_inputs["pixel_values"] = None
             model_inputs["pixel_attention_mask"] = None
 

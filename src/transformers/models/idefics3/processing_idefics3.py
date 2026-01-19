@@ -27,6 +27,11 @@ from ...image_utils import ImageInput, is_valid_image, load_image
 from ...processing_utils import ImagesKwargs, MultiModalData, ProcessingKwargs, ProcessorMixin, Unpack
 from ...tokenization_utils_base import AddedToken, BatchEncoding, TextInput
 from ...utils import logging
+from ..got_ocr2.image_processing_got_ocr2 import (
+    get_optimal_tiled_canvas,
+    GotOcr2ImageProcessor,
+)
+from .image_processing_idefics3 import Idefics3ImageProcessor
 
 
 if TYPE_CHECKING:
@@ -53,12 +58,13 @@ def _prompt_split_image(image_seq_len, image_rows, image_cols, fake_token_around
             )
         text_split_images += "\n"
 
-    text_split_images += (
-        f"\n{fake_token_around_image}"
-        + f"{global_img_token}"
-        + f"{image_token}" * image_seq_len
-        + f"{fake_token_around_image}"
-    )
+    if image_rows * image_cols > 1:
+        text_split_images += (
+            f"\n{fake_token_around_image}"
+            + f"{global_img_token}"
+            + f"{image_token}" * image_seq_len
+            + f"{fake_token_around_image}"
+        )
     return text_split_images
 
 
@@ -112,12 +118,12 @@ class Idefics3Processor(ProcessorMixin):
     r"""
     Constructs a Idefics3 processor which wraps a LLama tokenizer and Idefics3 image processor into a single processor.
 
-    [`Idefics3Processor`] offers all the functionalities of [`Idefics3ImageProcessor`] and [`Idefics3TokenizerFast`]. See
+    [`Idefics3Processor`] offers all the functionalities of [`Idefics3ImageProcessor`] (or [`GotOcr2ImageProcessor`]). See
     the docstring of [`~IdeficsProcessor.__call__`] and [`~IdeficsProcessor.decode`] for more information.
 
     Args:
-        image_processor (`Idefics3ImageProcessor`):
-            An instance of [`Idefics3ImageProcessor`]. The image processor is a required input.
+        image_processor (`Idefics3ImageProcessor` or `GotOcr2ImageProcessor`):
+            An instance of [`Idefics3ImageProcessor`] or [`GotOcr2ImageProcessor`]. The image processor is a required input.
         tokenizer (`PreTrainedTokenizerBase`, *optional*):
             An instance of [`PreTrainedTokenizerBase`]. This should correspond with the model's text model. The tokenizer is a required input.
         image_seq_len (`int`, *optional*, defaults to 169):
@@ -140,7 +146,7 @@ class Idefics3Processor(ProcessorMixin):
     """
 
     attributes = ["image_processor", "tokenizer"]
-    image_processor_class = "Idefics3ImageProcessor"
+    image_processor_class = ("Idefics3ImageProcessor", "GotOcr2ImageProcessor")
     tokenizer_class = "AutoTokenizer"
 
     def __init__(
@@ -306,8 +312,37 @@ class Idefics3Processor(ProcessorMixin):
                         f"The number of images in the text {n_images_in_text} and images {n_images_in_images} should be the same."
                     )
 
-                image_rows = inputs.pop("rows", [[0] * len(text)])
-                image_cols = inputs.pop("cols", [[0] * len(text)])
+                # image_rows = inputs.pop("rows", [[0] * len(text)])
+                # image_cols = inputs.pop("cols", [[0] * len(text)])
+                if isinstance(self.image_processor, Idefics3ImageProcessor):
+                    image_rows = inputs.pop("rows", [[0] * len(text)])
+                    image_cols = inputs.pop("cols", [[0] * len(text)])
+                elif isinstance(self.image_processor, GotOcr2ImageProcessor):
+                    # GotOcr2ImageProcessor doesn't return rows/cols, compute them
+                    image_rows = []
+                    image_cols = []
+                    for sample_images in images:
+                        sample_image_rows = []
+                        sample_image_cols = []
+                        for img in sample_images:
+                            width, height = img.size
+                            n_cols, n_rows = get_optimal_tiled_canvas(
+                                (height, width),
+                                (
+                                    self.image_processor.size["height"],
+                                    self.image_processor.size["width"],
+                                ),
+                                self.image_processor.min_patches,
+                                self.image_processor.max_patches,
+                            )
+                            sample_image_rows.append(n_rows)
+                            sample_image_cols.append(n_cols)
+                        image_rows.append(sample_image_rows)
+                        image_cols.append(sample_image_cols)
+                else:
+                    raise ValueError(
+                        "Invalid image processor. Only Idefics3ImageProcessor and GotOcr2ImageProcessor are supported."
+                    )
 
                 fake_image_token = self.fake_image_token
                 image_token = self.image_token

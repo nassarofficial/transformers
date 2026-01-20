@@ -177,7 +177,6 @@ class Idefics3Processor(ProcessorMixin):
         }
         tokenizer.add_special_tokens(tokens_to_add)
         self.image_token_id = tokenizer.convert_tokens_to_ids(self.image_token)
-
         super().__init__(image_processor, tokenizer, chat_template=chat_template, **kwargs)
 
     def _extract_images_from_prompts(self, prompts):
@@ -303,6 +302,9 @@ class Idefics3Processor(ProcessorMixin):
             # Load images if they are URLs
             images = [[load_image(im) if is_url(im) else im for im in sample] for sample in images]
 
+            if isinstance(self.image_processor, GotOcr2ImageProcessor):
+                output_kwargs["images_kwargs"].pop("return_row_col_info", None)  # GotOcr2ImageProcessor doesn't use this arg
+
             image_inputs = self.image_processor(images, **output_kwargs["images_kwargs"])
             inputs.update(image_inputs)
 
@@ -339,6 +341,13 @@ class Idefics3Processor(ProcessorMixin):
                             sample_image_cols.append(n_cols)
                         image_rows.append(sample_image_rows)
                         image_cols.append(sample_image_cols)
+
+                    # Post-process inputs for GotOcr2ImageProcessor
+                    inputs.pop("num_patches", None)  # Not needed downstream
+                    pixel_values = inputs.get("pixel_values")
+                    if pixel_values is not None and len(pixel_values.shape) == 4:
+                        # Make 5D to match Idefics3 expected format: (batch, num_images, num_channels, height, width)
+                        inputs["pixel_values"] = pixel_values.unsqueeze(0)
                 else:
                     raise ValueError(
                         "Invalid image processor. Only Idefics3ImageProcessor and GotOcr2ImageProcessor are supported."

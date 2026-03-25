@@ -343,11 +343,46 @@ class Idefics3Processor(ProcessorMixin):
                         image_cols.append(sample_image_cols)
 
                     # Post-process inputs for GotOcr2ImageProcessor
-                    inputs.pop("num_patches", None)  # Not needed downstream
+                    num_patches_arr = inputs.pop("num_patches", None)
                     pixel_values = inputs.get("pixel_values")
                     if pixel_values is not None and len(pixel_values.shape) == 4:
-                        # Make 5D to match Idefics3 expected format: (batch, num_images, num_channels, height, width)
-                        inputs["pixel_values"] = pixel_values.unsqueeze(0)
+                        # Make 5D to match Idefics3 expected format: (batch, num_images, C, H, W)
+                        # pixel_values is (total_sub_images, C, H, W) — a flat concat of all patches
+                        # from all images. We need to group them per sample and pad to the max
+                        # patch count so the tensor is rectangular.  The Idefics3 model's
+                        # get_image_features will filter out zero-padded (all-zero) sub-images.
+                        batch_size = len(images)
+
+                        # Compute number of sub-images per sample (sum patches of each image in the sample)
+                        if num_patches_arr is not None:
+                            img_offset = 0
+                            patches_per_sample = []
+                            for sample_imgs in images:
+                                n_imgs = len(sample_imgs)
+                                patches_per_sample.append(int(sum(num_patches_arr[img_offset:img_offset + n_imgs])))
+                                img_offset += n_imgs
+                        else:
+                            # Fallback: assume equal distribution
+                            total = pixel_values.shape[0]
+                            patches_per_sample = [total // batch_size] * batch_size
+
+                        max_patches = max(patches_per_sample)
+                        if all(p == max_patches for p in patches_per_sample):
+                            # All samples have the same number of sub-images — simple reshape
+                            inputs["pixel_values"] = pixel_values.reshape(batch_size, max_patches, *pixel_values.shape[1:])
+                        else:
+                            # Variable sub-image counts — pad shorter samples with zeros
+                            # (the model filters out all-zero sub-images in get_image_features)
+                            import torch
+                            padded = torch.zeros(
+                                batch_size, max_patches, *pixel_values.shape[1:],
+                                dtype=pixel_values.dtype, device=pixel_values.device,
+                            )
+                            pv_offset = 0
+                            for i, count in enumerate(patches_per_sample):
+                                padded[i, :count] = pixel_values[pv_offset:pv_offset + count]
+                                pv_offset += count
+                            inputs["pixel_values"] = padded
                 else:
                     raise ValueError(
                         "Invalid image processor. Only Idefics3ImageProcessor and GotOcr2ImageProcessor are supported."

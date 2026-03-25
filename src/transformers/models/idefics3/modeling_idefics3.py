@@ -608,6 +608,20 @@ class Idefics3Model(Idefics3PreTrainedModel):
 
         special_image_mask = special_image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
         image_hidden_states = image_hidden_states.to(inputs_embeds.device, inputs_embeds.dtype)
+
+        # # Verify that the number of image tokens matches the number of image hidden states
+        # num_image_tokens = special_image_mask[:, :, 0].sum().item()
+        # num_image_hidden = image_hidden_states.numel() // image_hidden_states.shape[-1]
+        # if num_image_tokens != num_image_hidden:
+        #     raise ValueError(
+        #         f"Image token / hidden-state mismatch in inputs_merger: "
+        #         f"input_ids has {num_image_tokens} image tokens, but "
+        #         f"image_hidden_states has {num_image_hidden} vectors "
+        #         f"(shape {tuple(image_hidden_states.shape)}). "
+        #         f"This usually means pixel_values has the wrong number of "
+        #         f"sub-images for this batch."
+        #     )
+
         inputs_embeds = inputs_embeds.masked_scatter(special_image_mask, image_hidden_states)
         return inputs_embeds
 

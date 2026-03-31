@@ -23,6 +23,7 @@ from functools import lru_cache
 from typing import TYPE_CHECKING, Union
 
 import numpy as np
+import torch
 
 from ...feature_extraction_utils import BatchFeature
 from ...image_utils import ImageInput, is_valid_image, load_image
@@ -54,7 +55,12 @@ def is_url(val) -> bool:
 
 
 def _prompt_split_image(image_seq_len, image_rows, image_cols, fake_token_around_image, image_token, global_img_token):
-    """Prompt with expanded image tokens for when the image is split into patches."""
+    """Prompt with expanded image tokens for when the image is split into patches.
+
+    Only includes the global thumbnail token when there are multiple tiles (image_rows * image_cols > 1),
+    matching the nanoVLM training-time behavior. GotOcr2ImageProcessor likewise only appends the
+    thumbnail patch when the image is split into more than one tile.
+    """
     text_split_images = ""
     for n_h in range(image_rows):
         for n_w in range(image_cols):
@@ -63,12 +69,13 @@ def _prompt_split_image(image_seq_len, image_rows, image_cols, fake_token_around
             )
         text_split_images += "\n"
 
-    text_split_images += (
-        f"\n{fake_token_around_image}"
-        + f"{global_img_token}"
-        + f"{image_token}" * image_seq_len
-        + f"{fake_token_around_image}"
-    )
+    if image_rows * image_cols > 1:
+        text_split_images += (
+            f"\n{fake_token_around_image}"
+            + f"{global_img_token}"
+            + f"{image_token}" * image_seq_len
+            + f"{fake_token_around_image}"
+        )
     return text_split_images
 
 
@@ -95,6 +102,39 @@ def get_image_prompt_string(
     return _prompt_split_image(
         image_seq_len, image_rows, image_cols, fake_token_around_image, image_token, global_img_token
     )
+
+
+def _compact_prompt_split_image(image_rows, image_cols, fake_token_around_image, global_img_token):
+    """Compact version of _prompt_split_image without repeated <image> tokens.
+
+    Image tokens are inserted post-tokenization via _expand_image_tokens_in_ids,
+    avoiding the cost of tokenizing hundreds of identical <image> placeholder strings
+    (recipe ⑦ from Huang et al., 2026 — a primary TTFT bottleneck for compact VLMs).
+    """
+    text = ""
+    for n_h in range(image_rows):
+        for n_w in range(image_cols):
+            text += f"{fake_token_around_image}<row_{n_h + 1}_col_{n_w + 1}>"
+        text += "\n"
+    if image_rows * image_cols > 1:
+        text += f"\n{fake_token_around_image}{global_img_token}{fake_token_around_image}"
+    return text
+
+
+def _compact_prompt_single_image(fake_token_around_image, global_img_token):
+    """Compact version of _prompt_single_image without repeated <image> tokens."""
+    return f"{fake_token_around_image}{global_img_token}{fake_token_around_image}"
+
+
+def get_compact_image_prompt_string(image_rows, image_cols, fake_token_around_image, global_img_token):
+    """Returns a compact prompt string without repeated <image> tokens.
+
+    Used for efficient tokenization: the tokenizer only processes structural tokens
+    (fake/row_col/global), and image tokens are spliced into input_ids afterwards.
+    """
+    if image_rows == 0 and image_cols == 0:
+        return _compact_prompt_single_image(fake_token_around_image, global_img_token)
+    return _compact_prompt_split_image(image_rows, image_cols, fake_token_around_image, global_img_token)
 
 
 @lru_cache(maxsize=100)
@@ -191,9 +231,15 @@ class GraniteDoclingHybridProcessor(ProcessorMixin):
         self.image_token_id = tokenizer.convert_tokens_to_ids(self.image_token)
         self.fake_image_token_id = tokenizer.convert_tokens_to_ids(self.fake_image_token)
         self.global_image_token_id = tokenizer.convert_tokens_to_ids(self.global_image_tag)
-        self.row_col_ids = [
-            tokenizer.convert_tokens_to_ids(f"<row_{i + 1}_col_{j + 1}>") for i in range(6) for j in range(6)
-        ]
+        # Cover up to 16×16 grids (max_patches=256); stored as a set for O(1) lookup
+        # during post-tokenization image-token expansion.
+        _unk = tokenizer.unk_token_id
+        self.row_col_ids = {
+            tid for tid in (
+                tokenizer.convert_tokens_to_ids(f"<row_{i + 1}_col_{j + 1}>")
+                for i in range(16) for j in range(16)
+            ) if tid != _unk
+        }
 
         # This regex matches one or more occurrences of <global-img> tags (optionally surrounded by newline characters)
         # or <row_x_col_y> tags (where x and y are digits, also optionally surrounded by newline characters).
@@ -222,6 +268,42 @@ class GraniteDoclingHybridProcessor(ProcessorMixin):
                     images.append(load_image(elem))
             prompt_images.append(images)
         return prompt_images
+
+    def _expand_image_tokens_in_ids(
+        self,
+        input_ids: list[list[int]],
+        attention_mask: list[list[int]],
+    ) -> tuple[list[list[int]], list[list[int]]]:
+        """Insert image_seq_len <image> token IDs after each row/col and global-img marker.
+
+        This is the counterpart to compact tokenization (recipe ⑦, Huang et al. 2026):
+        instead of tokenizing a prompt that contains hundreds of repeated '<image>' strings,
+        we tokenize a compact version and expand here with a fast Python list splice.
+
+        The resulting input_ids are identical to what full-prompt tokenization produces,
+        so the model forward pass is unaffected.
+        """
+        image_token_id = self.image_token_id
+        row_col_ids = self.row_col_ids  # set[int]
+        global_id = self.global_image_token_id
+        image_seq_len = self.image_seq_len
+        image_fill = [image_token_id] * image_seq_len
+        mask_fill = [1] * image_seq_len
+
+        expanded_ids = []
+        expanded_mask = []
+        for ids_row, mask_row in zip(input_ids, attention_mask):
+            new_ids: list[int] = []
+            new_mask: list[int] = []
+            for tok_id, m in zip(ids_row, mask_row):
+                new_ids.append(tok_id)
+                new_mask.append(m)
+                if tok_id in row_col_ids or tok_id == global_id:
+                    new_ids.extend(image_fill)
+                    new_mask.extend(mask_fill)
+            expanded_ids.append(new_ids)
+            expanded_mask.append(new_mask)
+        return expanded_ids, expanded_mask
 
     @auto_docstring
     def __call__(
@@ -279,7 +361,17 @@ class GraniteDoclingHybridProcessor(ProcessorMixin):
             n_images_in_images = [len(sample) if isinstance(sample, (list, tuple)) else 1 for sample in images]
             images = [[sample] if not isinstance(sample, (list, tuple)) else sample for sample in images]
 
-            image_inputs = self.image_processor(images, **output_kwargs["images_kwargs"])
+            # Recipe ⑧ (Huang et al. 2026 §3.3): skip CPU-side rescale + normalize so
+            # pixel_values are transferred as uint8 (1 byte/pixel) instead of float32
+            # (4 bytes) or bfloat16 (2 bytes). The model normalizes on GPU instead.
+            uint8_kwargs = dict(output_kwargs["images_kwargs"])
+            uint8_kwargs["do_rescale"] = False
+            uint8_kwargs["do_normalize"] = False
+            image_inputs = self.image_processor(images, **uint8_kwargs)
+            # Convert float32 [0, 255] → uint8 [0, 255]: lossless for integer-valued pixels
+            pv = image_inputs.get("pixel_values")
+            if pv is not None:
+                image_inputs["pixel_values"] = pv.to(dtype=torch.uint8)
             inputs.update(image_inputs)
 
             if text is not None:
@@ -321,11 +413,12 @@ class GraniteDoclingHybridProcessor(ProcessorMixin):
                 image_token = self.image_token
                 global_img_token = self.global_image_tag
 
-                prompt_strings = []
+                prompt_strings = []         # full expanded — only used for _check_special_mm_tokens
+                compact_prompt_strings = [] # compact — used for tokenization (no repeated <image> tokens)
                 batch_image_seq_lengths = []
                 for sample, sample_rows, sample_cols in zip(text, image_rows, image_cols):
-                    # Replace the image token with fake tokens around the expanded image token sequence of length `image_seq_len`
                     image_prompt_strings = []
+                    compact_image_prompt_strings = []
                     image_seq_lengths = []
                     for n_rows, n_cols in zip(sample_rows, sample_cols):
                         image_prompt_string = get_image_prompt_string(
@@ -336,23 +429,50 @@ class GraniteDoclingHybridProcessor(ProcessorMixin):
                             fake_token_around_image=fake_image_token,
                             global_img_token=global_img_token,
                         )
+                        compact_image_prompt_string = get_compact_image_prompt_string(
+                            n_rows,
+                            n_cols,
+                            fake_token_around_image=fake_image_token,
+                            global_img_token=global_img_token,
+                        )
                         # Add +2 and +3 for special BOI/EOI/fake_image_wrapper tokens
                         row_length = (self.image_seq_len + 2) * n_cols + 1
                         image_seq_lengths.append((self.image_seq_len + 3) + row_length * n_rows)
                         image_prompt_strings.append(image_prompt_string)
+                        compact_image_prompt_strings.append(compact_image_prompt_string)
 
                     batch_image_seq_lengths.append(image_seq_lengths)
                     split_sample = sample.split(image_token)
                     if len(split_sample) == 0:
                         raise ValueError("The image token should be present in the text.")
 
-                    # Place in the image prompt strings where the image tokens are
-                    sample = split_sample[0]
-                    for i, image_prompt_string in enumerate(image_prompt_strings):
-                        sample += image_prompt_string + split_sample[i + 1]
-                    prompt_strings.append(sample)
+                    full_sample = split_sample[0]
+                    compact_sample = split_sample[0]
+                    for i, (full_str, compact_str) in enumerate(
+                        zip(image_prompt_strings, compact_image_prompt_strings)
+                    ):
+                        full_sample += full_str + split_sample[i + 1]
+                        compact_sample += compact_str + split_sample[i + 1]
+                    prompt_strings.append(full_sample)
+                    compact_prompt_strings.append(compact_sample)
 
-                text_inputs = self.tokenizer(prompt_strings, **output_kwargs["text_kwargs"])
+                # Tokenize compact prompts — avoids tokenizing N*image_seq_len repeated
+                # '<image>' strings (recipe ⑦, Huang et al. 2026 §3.3).
+                text_inputs = self.tokenizer(compact_prompt_strings, **output_kwargs["text_kwargs"])
+
+                # Expand: splice image_seq_len <image> token IDs after each row/col and
+                # global-img marker. Result is identical to full-prompt tokenization.
+                input_ids = text_inputs["input_ids"]
+                attention_mask = text_inputs.get(
+                    "attention_mask", [[1] * len(ids) for ids in input_ids]
+                )
+                expanded_ids, expanded_mask = self._expand_image_tokens_in_ids(
+                    input_ids, attention_mask
+                )
+                text_inputs["input_ids"] = expanded_ids
+                if "attention_mask" in text_inputs:
+                    text_inputs["attention_mask"] = expanded_mask
+
                 self._check_special_mm_tokens(prompt_strings, text_inputs, modalities=["image"])
                 inputs.update(text_inputs)
 

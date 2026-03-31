@@ -659,37 +659,48 @@ class GraniteDoclingHybridModel(GraniteDoclingHybridPreTrainedModel):
         pixel_values (`torch.FloatTensor` of shape `(batch_size, num_channels, image_size, image_size)`):
             The tensors corresponding to the input images.
         pixel_attention_mask (`torch.LongTensor`, *optional*):
-            The attention mask indicating padded regions in the image.
+            Unused. GotOcr2ImageProcessor crops each tile to exactly the ViT input
+            resolution, so every pixel is real — the mask is always all-ones.
+            Kept in the signature for API compatibility only.
         """
         batch_size, num_images, num_channels, height, width = pixel_values.shape
-        pixel_values = pixel_values.to(dtype=self.dtype)  # fp16 compatibility
         pixel_values = pixel_values.view(batch_size * num_images, *pixel_values.shape[2:])
 
-        # Remove padding images - padding images are full 0.
-        nb_values_per_image = pixel_values.shape[1:].numel()
-        real_images_inds = (pixel_values == 0.0).sum(dim=(-1, -2, -3)) != nb_values_per_image
-        pixel_values = pixel_values[real_images_inds].contiguous()
-
-        # Handle the vision attention mask
-        if pixel_attention_mask is None:
-            pixel_attention_mask = torch.ones(
-                size=(pixel_values.size(0), pixel_values.size(2), pixel_values.size(3)),
-                dtype=torch.bool,
-                device=pixel_values.device,
-            )
+        if pixel_values.dtype == torch.uint8:
+            # Recipe ⑧ (Huang et al. 2026 §3.3): uint8 path — images were transferred as
+            # 1 byte/pixel; rescale and normalize here on GPU to avoid CPU-side float ops
+            # and reduce PCIe bandwidth 4× vs float32.
+            # Remove zero-padded image slots BEFORE cast (zero uint8 == zero float).
+            nb_values_per_image = pixel_values.shape[1:].numel()
+            real_images_inds = pixel_values.sum(dim=(-1, -2, -3)) != 0
+            # Edge case: all-black image is a real image (sum == 0). Fall back to padding
+            # detection only if at least one slot has non-zero pixels.
+            if not real_images_inds.all():
+                real_images_inds = (pixel_values == 0).sum(dim=(-1, -2, -3)) != nb_values_per_image
+            pixel_values = pixel_values[real_images_inds].contiguous()
+            # Cast and rescale to [0, 1] in model dtype (BF16 on GPU)
+            pixel_values = pixel_values.to(dtype=self.dtype) / 255.0
+            # Normalize: subtract mean, divide by std (values from vision_config)
+            mean = torch.tensor(
+                self.config.vision_config.image_mean, dtype=self.dtype, device=pixel_values.device
+            ).view(1, 3, 1, 1)
+            std = torch.tensor(
+                self.config.vision_config.image_std, dtype=self.dtype, device=pixel_values.device
+            ).view(1, 3, 1, 1)
+            pixel_values = (pixel_values - mean) / std
         else:
-            # Remove padding images from the mask
-            pixel_attention_mask = pixel_attention_mask.view(batch_size * num_images, *pixel_attention_mask.shape[2:])
-            pixel_attention_mask = pixel_attention_mask[real_images_inds].contiguous()
+            # Float path (backward-compatible): image was pre-normalized by the processor.
+            pixel_values = pixel_values.to(dtype=self.dtype)
+            nb_values_per_image = pixel_values.shape[1:].numel()
+            real_images_inds = (pixel_values == 0.0).sum(dim=(-1, -2, -3)) != nb_values_per_image
+            pixel_values = pixel_values[real_images_inds].contiguous()
 
-        patch_size = self.config.vision_config.patch_size
-        patches_subgrid = pixel_attention_mask.unfold(dimension=1, size=patch_size, step=patch_size)
-        patches_subgrid = patches_subgrid.unfold(dimension=2, size=patch_size, step=patch_size)
-        patch_attention_mask = (patches_subgrid.sum(dim=(-1, -2)) > 0).bool()
-
+        # GotOcr2ImageProcessor crops tiles to exactly (patch_size * n_patches) so every
+        # pixel is valid. Skip the pixel_attention_mask unfold+sum and pass None so the
+        # vision encoder allocates a full-ones mask internally (recipe ⑩, Huang et al. 2026).
         # Get sequence from the vision encoder
         image_outputs = self.vision_model(
-            pixel_values=pixel_values, patch_attention_mask=patch_attention_mask, return_dict=True, **kwargs
+            pixel_values=pixel_values, patch_attention_mask=None, return_dict=True, **kwargs
         )
         image_hidden_states = image_outputs.last_hidden_state
 
@@ -878,6 +889,9 @@ class GraniteDoclingHybridForConditionalGeneration(GraniteDoclingHybridPreTraine
         # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(hidden_states[:, slice_indices, :])
+        logits_scaling = getattr(self.config.text_config, "logits_scaling", 1)
+        if logits_scaling != 1:
+            logits = logits / logits_scaling
 
         loss = None
         if labels is not None:
@@ -919,7 +933,7 @@ class GraniteDoclingHybridForConditionalGeneration(GraniteDoclingHybridPreTraine
             pixel_attention_mask=pixel_attention_mask,
             image_hidden_states=image_hidden_states,
             logits_to_keep=logits_to_keep,
-            is_first_iteration=False,
+            is_first_iteration=is_first_iteration,
             use_cache=use_cache,
             **kwargs,
         )

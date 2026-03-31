@@ -30,6 +30,35 @@ logger = logging.get_logger(__name__)
 @auto_docstring(checkpoint="HuggingFaceM4/GraniteDoclingHybrid-8B-Llama3")
 class GraniteDoclingHybridVisionConfig(PreTrainedConfig):
     r"""
+    Args:
+        hidden_size (`int`, *optional*, defaults to 1152):
+            Dimensionality of the encoder layers and the pooler layer.
+        intermediate_size (`int`, *optional*, defaults to 3072):
+            Dimensionality of the feed-forward layer in the transformer encoder.
+        num_hidden_layers (`int`, *optional*, defaults to 12):
+            Number of hidden layers in the transformer encoder.
+        num_attention_heads (`int`, *optional*, defaults to 16):
+            Number of attention heads for each attention layer in the transformer encoder.
+        num_channels (`int`, *optional*, defaults to 3):
+            Number of input image channels.
+        image_size (`int`, *optional*, defaults to 224):
+            The size (resolution) of each image tile.
+        patch_size (`int`, *optional*, defaults to 32):
+            The size (resolution) of each patch.
+        hidden_act (`str`, *optional*, defaults to `"gelu_pytorch_tanh"`):
+            The non-linear activation function in the encoder and pooler.
+        layer_norm_eps (`float`, *optional*, defaults to 1e-6):
+            The epsilon used by the layer normalization layers.
+        attention_dropout (`float`, *optional*, defaults to 0.0):
+            The dropout ratio for the attention probabilities.
+        initializer_range (`float`, *optional*, defaults to 0.02):
+            The standard deviation of the truncated_normal_initializer for initializing weight matrices.
+        image_mean (`list[float]`, *optional*, defaults to `[0.48145466, 0.4578275, 0.40821073]`):
+            Per-channel mean used to normalize pixel values. When the processor outputs uint8 images
+            (recipe ⑧), the model normalizes on GPU using these values.
+        image_std (`list[float]`, *optional*, defaults to `[0.26862954, 0.26130258, 0.27577711]`):
+            Per-channel standard deviation used to normalize pixel values. See `image_mean`.
+
     Example:
 
     ```python
@@ -62,6 +91,8 @@ class GraniteDoclingHybridVisionConfig(PreTrainedConfig):
         layer_norm_eps=1e-6,
         attention_dropout=0.0,
         initializer_range=0.02,
+        image_mean=(0.48145466, 0.4578275, 0.40821073),
+        image_std=(0.26862954, 0.26130258, 0.27577711),
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -77,6 +108,8 @@ class GraniteDoclingHybridVisionConfig(PreTrainedConfig):
         self.layer_norm_eps = layer_norm_eps
         self.hidden_act = hidden_act
         self.initializer_range = initializer_range
+        self.image_mean = list(image_mean)
+        self.image_std = list(image_std)
 
 
 @auto_docstring(checkpoint="ibm-granite/granite-speech-3.2-8b")

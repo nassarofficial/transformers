@@ -39,8 +39,91 @@ from ..idefics3.modeling_idefics3 import (
     Idefics3Model,
     Idefics3PreTrainedModel,
 )
-from ..idefics3.processing_idefics3 import Idefics3Processor, get_image_prompt_string
+from ..idefics3.processing_idefics3 import Idefics3Processor
 from .configuration_granite_docling_hybrid import GraniteDoclingHybridConfig
+
+
+def _prompt_split_image(image_seq_len, image_rows, image_cols, fake_token_around_image, image_token, global_img_token):
+    """Prompt with expanded image tokens for when the image is split into patches.
+
+    Only includes the global thumbnail token when there are multiple tiles (image_rows * image_cols > 1),
+    matching the nanoVLM training-time behavior. GotOcr2ImageProcessor likewise only appends the
+    thumbnail patch when the image is split into more than one tile.
+    """
+    text_split_images = ""
+    for n_h in range(image_rows):
+        for n_w in range(image_cols):
+            text_split_images += (
+                f"{fake_token_around_image}" + f"<row_{n_h + 1}_col_{n_w + 1}>" + f"{image_token}" * image_seq_len
+            )
+        text_split_images += "\n"
+
+    if image_rows * image_cols > 1:
+        text_split_images += (
+            f"\n{fake_token_around_image}"
+            + f"{global_img_token}"
+            + f"{image_token}" * image_seq_len
+            + f"{fake_token_around_image}"
+        )
+    return text_split_images
+
+
+def _prompt_single_image(image_seq_len, fake_token_around_image, image_token, global_img_token):
+    """Prompt with expanded image tokens for a single image (no tiles)."""
+    return (
+        f"{fake_token_around_image}"
+        + f"{global_img_token}"
+        + f"{image_token}" * image_seq_len
+        + f"{fake_token_around_image}"
+    )
+
+
+def get_image_prompt_string(
+    image_rows, image_cols, image_seq_len, fake_token_around_image, image_token, global_img_token
+):
+    if image_rows == 0 and image_cols == 0:
+        return _prompt_single_image(
+            image_seq_len,
+            fake_token_around_image=fake_token_around_image,
+            image_token=image_token,
+            global_img_token=global_img_token,
+        )
+    return _prompt_split_image(
+        image_seq_len, image_rows, image_cols, fake_token_around_image, image_token, global_img_token
+    )
+
+
+def _compact_prompt_split_image(image_rows, image_cols, fake_token_around_image, global_img_token):
+    """Compact version of _prompt_split_image without repeated <image> tokens.
+
+    Image tokens are inserted post-tokenization via _expand_image_tokens_in_ids,
+    avoiding the cost of tokenizing hundreds of identical <image> placeholder strings
+    (recipe ⑦ from Huang et al., 2026 — a primary TTFT bottleneck for compact VLMs).
+    """
+    text = ""
+    for n_h in range(image_rows):
+        for n_w in range(image_cols):
+            text += f"{fake_token_around_image}<row_{n_h + 1}_col_{n_w + 1}>"
+        text += "\n"
+    if image_rows * image_cols > 1:
+        text += f"\n{fake_token_around_image}{global_img_token}{fake_token_around_image}"
+    return text
+
+
+def _compact_prompt_single_image(fake_token_around_image, global_img_token):
+    """Compact version of _prompt_single_image without repeated <image> tokens."""
+    return f"{fake_token_around_image}{global_img_token}{fake_token_around_image}"
+
+
+def get_compact_image_prompt_string(image_rows, image_cols, fake_token_around_image, global_img_token):
+    """Returns a compact prompt string without repeated <image> tokens.
+
+    Used for efficient tokenization: the tokenizer only processes structural tokens
+    (fake/row_col/global), and image tokens are spliced into input_ids afterwards.
+    """
+    if image_rows == 0 and image_cols == 0:
+        return _compact_prompt_single_image(fake_token_around_image, global_img_token)
+    return _compact_prompt_split_image(image_rows, image_cols, fake_token_around_image, global_img_token)
 
 
 if TYPE_CHECKING:
@@ -147,6 +230,54 @@ class GraniteDoclingHybridProcessorKwargs(ProcessingKwargs, total=False):
 @auto_docstring
 class GraniteDoclingHybridProcessor(Idefics3Processor):
 
+    def __init__(self, image_processor, tokenizer=None, image_seq_len: int = 169, chat_template=None, **kwargs):
+        super().__init__(image_processor, tokenizer=tokenizer, image_seq_len=image_seq_len, chat_template=chat_template, **kwargs)
+        # Cover up to 16×16 grids (max_patches=256); stored as a set for O(1) lookup
+        # during post-tokenization image-token expansion.
+        _unk = tokenizer.unk_token_id if tokenizer is not None else None
+        self.row_col_ids = {
+            tid for tid in (
+                tokenizer.convert_tokens_to_ids(f"<row_{i + 1}_col_{j + 1}>")
+                for i in range(16) for j in range(16)
+            ) if tid != _unk
+        } if tokenizer is not None else set()
+
+    def _expand_image_tokens_in_ids(
+        self,
+        input_ids: list[list[int]],
+        attention_mask: list[list[int]],
+    ) -> tuple[list[list[int]], list[list[int]]]:
+        """Insert image_seq_len <image> token IDs after each row/col and global-img marker.
+
+        This is the counterpart to compact tokenization (recipe ⑦, Huang et al. 2026):
+        instead of tokenizing a prompt that contains hundreds of repeated '<image>' strings,
+        we tokenize a compact version and expand here with a fast Python list splice.
+
+        The resulting input_ids are identical to what full-prompt tokenization produces,
+        so the model forward pass is unaffected.
+        """
+        image_token_id = self.image_token_id
+        row_col_ids = self.row_col_ids  # set[int]
+        global_id = self.global_image_token_id
+        image_seq_len = self.image_seq_len
+        image_fill = [image_token_id] * image_seq_len
+        mask_fill = [1] * image_seq_len
+
+        expanded_ids = []
+        expanded_mask = []
+        for ids_row, mask_row in zip(input_ids, attention_mask):
+            new_ids: list[int] = []
+            new_mask: list[int] = []
+            for tok_id, m in zip(ids_row, mask_row):
+                new_ids.append(tok_id)
+                new_mask.append(m)
+                if tok_id in row_col_ids or tok_id == global_id:
+                    new_ids.extend(image_fill)
+                    new_mask.extend(mask_fill)
+            expanded_ids.append(new_ids)
+            expanded_mask.append(new_mask)
+        return expanded_ids, expanded_mask
+
     def __call__(
         self,
         images: ImageInput | list[ImageInput] | list[list[ImageInput]] = None,
@@ -205,7 +336,17 @@ class GraniteDoclingHybridProcessor(Idefics3Processor):
                 for sample in images
             ]
 
-            image_inputs = self.image_processor(images, **output_kwargs["images_kwargs"])
+            # Recipe ⑧ (Huang et al. 2026 §3.3): skip CPU-side rescale + normalize so
+            # pixel_values are transferred as uint8 (1 byte/pixel) instead of float32
+            # (4 bytes) or bfloat16 (2 bytes). The model normalizes on GPU instead.
+            uint8_kwargs = dict(output_kwargs["images_kwargs"])
+            uint8_kwargs["do_rescale"] = False
+            uint8_kwargs["do_normalize"] = False
+            image_inputs = self.image_processor(images, **uint8_kwargs)
+            # Convert float32 [0, 255] → uint8 [0, 255]: lossless for integer-valued pixels
+            pv = image_inputs.get("pixel_values")
+            if pv is not None:
+                image_inputs["pixel_values"] = pv.to(dtype=torch.uint8)
             inputs.update(image_inputs)
 
             if text is not None:
@@ -247,11 +388,12 @@ class GraniteDoclingHybridProcessor(Idefics3Processor):
                 image_token = self.image_token
                 global_img_token = self.global_image_tag
 
-                prompt_strings = []
+                prompt_strings = []         # full expanded — only used for _check_special_mm_tokens
+                compact_prompt_strings = [] # compact — used for tokenization (no repeated <image> tokens)
                 batch_image_seq_lengths = []
                 for sample, sample_rows, sample_cols in zip(text, image_rows, image_cols):
-                    # Replace the image token with fake tokens around the expanded image token sequence of length `image_seq_len`
                     image_prompt_strings = []
+                    compact_image_prompt_strings = []
                     image_seq_lengths = []
                     for n_rows, n_cols in zip(sample_rows, sample_cols):
                         image_prompt_string = get_image_prompt_string(
@@ -262,23 +404,50 @@ class GraniteDoclingHybridProcessor(Idefics3Processor):
                             fake_token_around_image=fake_image_token,
                             global_img_token=global_img_token,
                         )
+                        compact_image_prompt_string = get_compact_image_prompt_string(
+                            n_rows,
+                            n_cols,
+                            fake_token_around_image=fake_image_token,
+                            global_img_token=global_img_token,
+                        )
                         # Add +2 and +3 for special BOI/EOI/fake_image_wrapper tokens
                         row_length = (self.image_seq_len + 2) * n_cols + 1
                         image_seq_lengths.append((self.image_seq_len + 3) + row_length * n_rows)
                         image_prompt_strings.append(image_prompt_string)
+                        compact_image_prompt_strings.append(compact_image_prompt_string)
 
                     batch_image_seq_lengths.append(image_seq_lengths)
                     split_sample = sample.split(image_token)
                     if len(split_sample) == 0:
                         raise ValueError("The image token should be present in the text.")
 
-                    # Place in the image prompt strings where the image tokens are
-                    sample = split_sample[0]
-                    for i, image_prompt_string in enumerate(image_prompt_strings):
-                        sample += image_prompt_string + split_sample[i + 1]
-                    prompt_strings.append(sample)
+                    full_sample = split_sample[0]
+                    compact_sample = split_sample[0]
+                    for i, (full_str, compact_str) in enumerate(
+                        zip(image_prompt_strings, compact_image_prompt_strings)
+                    ):
+                        full_sample += full_str + split_sample[i + 1]
+                        compact_sample += compact_str + split_sample[i + 1]
+                    prompt_strings.append(full_sample)
+                    compact_prompt_strings.append(compact_sample)
 
-                text_inputs = self.tokenizer(prompt_strings, **output_kwargs["text_kwargs"])
+                # Tokenize compact prompts — avoids tokenizing N*image_seq_len repeated
+                # '<image>' strings (recipe ⑦, Huang et al. 2026 §3.3).
+                text_inputs = self.tokenizer(compact_prompt_strings, **output_kwargs["text_kwargs"])
+
+                # Expand: splice image_seq_len <image> token IDs after each row/col and
+                # global-img marker. Result is identical to full-prompt tokenization.
+                input_ids = text_inputs["input_ids"]
+                attention_mask = text_inputs.get(
+                    "attention_mask", [[1] * len(ids) for ids in input_ids]
+                )
+                expanded_ids, expanded_mask = self._expand_image_tokens_in_ids(
+                    input_ids, attention_mask
+                )
+                text_inputs["input_ids"] = expanded_ids
+                if "attention_mask" in text_inputs:
+                    text_inputs["attention_mask"] = expanded_mask
+
                 self._check_special_mm_tokens(prompt_strings, text_inputs, modalities=["image"])
                 inputs.update(text_inputs)
 
@@ -328,6 +497,60 @@ class GraniteDoclingHybridPreTrainedModel(Idefics3PreTrainedModel):
 
 class GraniteDoclingHybridModel(Idefics3Model):
     config_class = GraniteDoclingHybridConfig
+
+    @can_return_tuple
+    @auto_docstring
+    def get_image_features(
+        self,
+        pixel_values: torch.FloatTensor,
+        pixel_attention_mask=None,
+        **kwargs,
+    ):
+        r"""
+        pixel_values (`torch.FloatTensor` of shape `(batch_size, num_channels, image_size, image_size)`):
+            The tensors corresponding to the input images.
+        pixel_attention_mask:
+            Unused. GotOcr2ImageProcessor crops each tile to exactly the ViT input
+            resolution, so every pixel is real — the mask is always all-ones.
+            Kept in the signature for API compatibility only.
+        """
+        batch_size, num_images, num_channels, height, width = pixel_values.shape
+        pixel_values = pixel_values.view(batch_size * num_images, *pixel_values.shape[2:])
+
+        if pixel_values.dtype == torch.uint8:
+            # Recipe ⑧ (Huang et al. 2026 §3.3): uint8 path — images were transferred as
+            # 1 byte/pixel; rescale and normalize here on GPU to avoid CPU-side float ops
+            # and reduce PCIe bandwidth 4× vs float32.
+            nb_values_per_image = pixel_values.shape[1:].numel()
+            real_images_inds = pixel_values.sum(dim=(-1, -2, -3)) != 0
+            if not real_images_inds.all():
+                real_images_inds = (pixel_values == 0).sum(dim=(-1, -2, -3)) != nb_values_per_image
+            pixel_values = pixel_values[real_images_inds].contiguous()
+            pixel_values = pixel_values.to(dtype=self.dtype) / 255.0
+            mean = torch.tensor(
+                self.config.vision_config.image_mean, dtype=self.dtype, device=pixel_values.device
+            ).view(1, 3, 1, 1)
+            std = torch.tensor(
+                self.config.vision_config.image_std, dtype=self.dtype, device=pixel_values.device
+            ).view(1, 3, 1, 1)
+            pixel_values = (pixel_values - mean) / std
+        else:
+            # Float path (backward-compatible): image was pre-normalized by the processor.
+            pixel_values = pixel_values.to(dtype=self.dtype)
+            nb_values_per_image = pixel_values.shape[1:].numel()
+            real_images_inds = (pixel_values == 0.0).sum(dim=(-1, -2, -3)) != nb_values_per_image
+            pixel_values = pixel_values[real_images_inds].contiguous()
+
+        # GotOcr2ImageProcessor crops tiles to exactly (patch_size * n_patches) so every
+        # pixel is valid. Skip the pixel_attention_mask unfold+sum and pass None so the
+        # vision encoder allocates a full-ones mask internally (recipe ⑩, Huang et al. 2026).
+        image_outputs = self.vision_model(
+            pixel_values=pixel_values, patch_attention_mask=None, return_dict=True, **kwargs
+        )
+        image_hidden_states = image_outputs.last_hidden_state
+        image_features = self.connector(image_hidden_states)
+        image_outputs.pooler_output = image_features
+        return image_outputs
 
     @can_return_tuple
     @auto_docstring
@@ -473,6 +696,9 @@ class GraniteDoclingHybridForConditionalGeneration(Idefics3ForConditionalGenerat
         # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.lm_head(hidden_states[:, slice_indices, :])
+        logits_scaling = getattr(self.config.text_config, "logits_scaling", 1)
+        if logits_scaling != 1:
+            logits = logits / logits_scaling
 
         loss = None
         if labels is not None:
@@ -515,7 +741,7 @@ class GraniteDoclingHybridForConditionalGeneration(Idefics3ForConditionalGenerat
             pixel_attention_mask=pixel_attention_mask,
             image_hidden_states=image_hidden_states,
             logits_to_keep=logits_to_keep,
-            is_first_iteration=False,
+            is_first_iteration=is_first_iteration,
             use_cache=use_cache,
             **kwargs,
         )

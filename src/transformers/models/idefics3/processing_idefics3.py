@@ -27,6 +27,8 @@ from ...processing_utils import MultiModalData, ProcessingKwargs, ProcessorMixin
 from ...tokenization_utils_base import AddedToken, BatchEncoding, TextInput
 from ...utils import auto_docstring, logging
 
+from .image_processing_idefics3 import Idefics3ImageProcessorKwargs
+
 
 if TYPE_CHECKING:
     from ...tokenization_utils_base import PreTokenizedInput
@@ -87,6 +89,7 @@ def get_image_prompt_string(
 
 
 class Idefics3ProcessorKwargs(ProcessingKwargs, total=False):
+    images_kwargs: Idefics3ImageProcessorKwargs
     _defaults = {
         "text_kwargs": {
             "add_special_tokens": True,
@@ -219,7 +222,13 @@ class Idefics3Processor(ProcessorMixin):
             # Load images if they are URLs
             images = [[load_image(im) if is_url(im) else im for im in sample] for sample in images]
 
-            image_inputs = self.image_processor(images, **output_kwargs["images_kwargs"])
+            image_kwargs = output_kwargs["images_kwargs"]
+            valid = getattr(self.image_processor, "valid_kwargs", None)
+            if valid is not None and "return_row_col_info" not in valid.__annotations__:
+                image_kwargs = {**image_kwargs}
+                image_kwargs.pop("return_row_col_info", None)
+
+            image_inputs = self.image_processor(images, **image_kwargs)
             inputs.update(image_inputs)
 
             if text is not None:

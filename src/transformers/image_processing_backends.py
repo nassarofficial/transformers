@@ -126,6 +126,10 @@ class TorchvisionBackend(BaseImageProcessor):
 
         if image_type == ImageType.PIL:
             image = tvF.pil_to_tensor(image)
+            # `tvF.pil_to_tensor` is always channels-first (C, H, W). Callers such as vLLM may pass
+            # `input_data_format="channels_last"` for raw tensor/numpy paths; applying that here would
+            # incorrectly permute to (H, W, C) and break `normalize` (e.g. 512 vs 3 channel mismatch).
+            input_data_format = None
         elif image_type == ImageType.NUMPY:
             image = torch.from_numpy(image).contiguous()
 

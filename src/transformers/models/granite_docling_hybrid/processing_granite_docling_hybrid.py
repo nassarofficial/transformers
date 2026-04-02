@@ -506,6 +506,10 @@ class GraniteDoclingHybridProcessor(ProcessorMixin):
         """
         Computes the number of placeholder tokens needed for multimodal inputs with the given sizes.
 
+        GotOcr2ImageProcessor.get_number_of_image_patches returns a plain int
+        (unlike Idefics3's 3-tuple), so we derive rows/cols ourselves via
+        get_optimal_tiled_canvas.
+
         Args:
             image_sizes (`list[list[int]]`, *optional*):
                 The input sizes formatted as (height, width) per each image.
@@ -514,27 +518,50 @@ class GraniteDoclingHybridProcessor(ProcessorMixin):
             `MultiModalData`: A `MultiModalData` object holding number of tokens per each of the provided
             input modalities, along with other useful data.
         """
+        from ..got_ocr2.image_processing_got_ocr2 import get_optimal_tiled_canvas
 
         vision_data = {}
         if image_sizes is not None:
             images_kwargs = GraniteDoclingHybridProcessorKwargs._defaults.get("images_kwargs", {})
             images_kwargs.update(kwargs)
 
-            num_image_row_cols = [
-                self.image_processor.get_number_of_image_patches(*image_size, images_kwargs)
-                for image_size in image_sizes
-            ]
+            ip = self.image_processor
+            min_patches = images_kwargs.get("min_patches", getattr(ip, "min_patches", 1))
+            max_patches = images_kwargs.get("max_patches", getattr(ip, "max_patches", 1))
+            patch_size = images_kwargs.get("patch_size", ip.size)
+            crop_to_patches = images_kwargs.get("crop_to_patches", getattr(ip, "crop_to_patches", False))
+
+            if isinstance(patch_size, dict):
+                patch_h, patch_w = patch_size["height"], patch_size["width"]
+            else:
+                patch_h, patch_w = patch_size.height, patch_size.width
 
             base_image_length = self.image_seq_len + 3
             col_length = self.image_seq_len + 2
             num_image_tokens = []
             num_image_patches = []
 
-            for num_patches, num_rows, num_cols in num_image_row_cols:
+            for height, width in image_sizes:
+                num_rows = num_cols = 0
+                n_patches = 1
+                if crop_to_patches and max_patches > 1:
+                    num_cols, num_rows = get_optimal_tiled_canvas(
+                        (height, width), (patch_h, patch_w), min_patches, max_patches
+                    )
+                    if num_cols * num_rows > 1:
+                        n_patches += num_cols * num_rows
+
                 row_length = col_length * num_cols + 1
                 num_image_tokens.append(base_image_length + (row_length * num_rows))
-                num_image_patches.append(num_patches)
+                num_image_patches.append(n_patches)
 
             vision_data.update({"num_image_tokens": num_image_tokens, "num_image_patches": num_image_patches})
 
         return MultiModalData(**vision_data)
+
+
+# Needed so `define_import_structure` registers these names on the lazy
+# `transformers.models.granite_docling_hybrid` module; without it,
+# `processor_class_from_name("GraniteDoclingHybridProcessor")` returns None and
+# `AutoProcessor` falls back to `AutoTokenizer`.
+__all__ = ["GraniteDoclingHybridProcessor", "GraniteDoclingHybridProcessorKwargs"]

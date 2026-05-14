@@ -942,10 +942,6 @@ class GenerationMixin(ContinuousMixin):
                 [mm_token_type_ids, mm_token_type_ids.new_zeros((mm_token_type_ids.shape[0], num_new_tokens))], dim=-1
             )
 
-        # BC for remote code models: advance cache_position if maintained
-        if (cache_position := model_kwargs.get("cache_position")) is not None:
-            model_kwargs["cache_position"] = cache_position[-1:] + num_new_tokens
-
         # Position ids (2D or 3D sometimes)
         position_ids_key = "position_ids" if not is_encoder_decoder else "decoder_position_ids"
         if (position_ids := model_kwargs.get(position_ids_key)) is not None:
@@ -1577,16 +1573,6 @@ class GenerationMixin(ContinuousMixin):
         # `prepare_inputs_for_generation` doesn't accept them, then a stricter check can be made ;)
         if "kwargs" in model_args or "model_kwargs" in model_args:
             model_args |= set(inspect.signature(self.forward).parameters)
-
-        # Remote code models may use non-standard VAR_KEYWORD names (e.g. **loss_kwargs instead of **kwargs).
-        # Since any VAR_KEYWORD accepts arbitrary keyword arguments, skip validation for remote code models
-        # that have one — we cannot enumerate their valid keys.
-        if self.is_remote_code() and any(
-            p.kind == inspect.Parameter.VAR_KEYWORD
-            for sig in (inspect.signature(self.forward), inspect.signature(self.prepare_inputs_for_generation))
-            for p in sig.parameters.values()
-        ):
-            return
 
         # Encoder-Decoder models may also need Encoder arguments from `model_kwargs`
         if self.config.is_encoder_decoder:
@@ -3841,22 +3827,6 @@ class GenerationMixin(ContinuousMixin):
                 if attention_mask is not None and input_ids.shape[1] == attention_mask.shape[1]:
                     # inputs will be sliced as `input_ids[:, -next_sequence_length :]` in `prepare_inputs_for_generation`
                     next_sequence_length = input_ids.shape[1] - past_length
-
-        # BC for remote code models: inject cache_position into model_kwargs when the model's
-        # prepare_inputs_for_generation expects it (removed from generate in transformers 5.x)
-        if (
-            "cache_position" not in model_kwargs
-            and self.is_remote_code()
-            and "cache_position"
-            in set(inspect.signature(type(self).prepare_inputs_for_generation).parameters)
-        ):
-            past_seen_tokens = 0
-            if (pkv := model_kwargs.get("past_key_values")) is not None:
-                past_seen_tokens = pkv.get_seq_length() if hasattr(pkv, "get_seq_length") else 0
-            seq_len = next_sequence_length if next_sequence_length is not None else input_ids.shape[1]
-            model_kwargs["cache_position"] = torch.arange(
-                past_seen_tokens, past_seen_tokens + seq_len, device=input_ids.device
-            )
 
         # Usual prefill
         if generation_config.prefill_chunk_size is None:

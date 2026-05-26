@@ -18,32 +18,48 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Optional, TypedDict
 
+import numpy as np
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 from transformers.activations import ACT2FN
 
+from ... import initialization as init
 from ...cache_utils import Cache
 from ...generation import GenerationMixin
-from ...masking_utils import create_bidirectional_mask
+from ...integrations import use_kernel_forward_from_hub, use_kernel_func_from_hub, use_kernelized_func
+from ...integrations.hub_kernels import lazy_load_kernel
+from ...masking_utils import create_bidirectional_mask, create_causal_mask
 from ...modeling_flash_attention_utils import FlashAttentionKwargs
 from ...modeling_layers import GradientCheckpointingLayer
-from ...modeling_outputs import BaseModelOutput, BaseModelOutputWithPooling, ModelOutput
+from ...modeling_outputs import (
+    BaseModelOutput,
+    BaseModelOutputWithPast,
+    BaseModelOutputWithPooling,
+    ModelOutput,
+    MoeModelOutputWithPast,
+)
+from ...modeling_rope_utils import ROPE_INIT_FUNCTIONS, dynamic_rope_update
 from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from ...processing_utils import Unpack
-from ...utils import TransformersKwargs, auto_docstring, can_return_tuple
-from ...utils.generic import merge_with_config_defaults
+from ...utils import TransformersKwargs, auto_docstring, can_return_tuple, is_torchdynamo_compiling, logging
+from ...utils.generic import maybe_autocast, merge_with_config_defaults
+from ...utils.import_utils import resolve_internal_import
 from ...utils.output_capturing import capture_outputs
-from ..auto import AutoModel
 from .configuration_granite_docling_hybrid import (
     GraniteDoclingHybridConfig,
-    GraniteDoclingHybridGraniteMoeHybridConfig,
+    GraniteDoclingHybridTextConfig,
     GraniteDoclingHybridVisionConfig,
 )
+
+
+logger = logging.get_logger(__name__)
 
 
 @dataclass
@@ -124,9 +140,7 @@ class HybridMambaAttentionDynamicCache:
 
     is_compileable = False
 
-    def __init__(
-        self, config: GraniteDoclingHybridGraniteMoeHybridConfig, batch_size, dtype=torch.float16, device=None
-    ):
+    def __init__(self, config: GraniteDoclingHybridTextConfig, batch_size, dtype=torch.float16, device=None):
         self.layers_block_type = config.layers_block_type
         self.has_previous_state = False  # only used by mamba
         conv_kernel_size = config.mamba_d_conv
@@ -216,6 +230,37 @@ class HybridMambaAttentionDynamicCache:
         return self.key_cache[layer_idx].shape[-2]
 
 
+def _build_2d_sincos_pos_embed(embed_dim: int, grid_size: int) -> torch.Tensor:
+    """2D sin-cos positional embedding of shape ``[grid_size**2, embed_dim]``.
+
+    Mirrors nanoVLM's ``_build_2d_sincos_pos_embed`` (MAE / MiniCPM construction):
+    half the channels encode the row index, the other half the column index, each
+    with a 1D sin-cos basis. ``np.meshgrid(grid_w, grid_h)`` gives the same
+    column-major axis order nanoVLM uses, so the resulting tensor lines up
+    byte-for-byte with a checkpoint trained under ``pixel_shuffle_mlp_v2``.
+    """
+    if embed_dim % 4 != 0:
+        raise ValueError("embed_dim must be divisible by 4 for 2D sincos positional embeddings.")
+
+    def _1d_sincos(dim: int, pos: np.ndarray) -> np.ndarray:
+        omega = np.arange(dim // 2, dtype=np.float32)
+        omega /= dim / 2.0
+        omega = 1.0 / 10000**omega
+        pos = pos.reshape(-1)
+        out = np.einsum("m,d->md", pos, omega)
+        return np.concatenate([np.sin(out), np.cos(out)], axis=1)
+
+    grid_h = np.arange(grid_size, dtype=np.float32)
+    grid_w = np.arange(grid_size, dtype=np.float32)
+    grid = np.meshgrid(grid_w, grid_h)  # column-major; matches MiniCPM / nanoVLM
+    grid = np.stack(grid, axis=0).reshape([2, 1, grid_size, grid_size])
+
+    emb_h = _1d_sincos(embed_dim // 2, grid[0])
+    emb_w = _1d_sincos(embed_dim // 2, grid[1])
+    emb = np.concatenate([emb_h, emb_w], axis=1)  # [grid_size**2, embed_dim]
+    return torch.from_numpy(emb).float()
+
+
 @auto_docstring
 class GraniteDoclingHybridPreTrainedModel(PreTrainedModel):
     config: GraniteDoclingHybridConfig
@@ -229,6 +274,1424 @@ class GraniteDoclingHybridPreTrainedModel(PreTrainedModel):
     _supports_flex_attn = True
     _supports_attention_backend = True
     config_class = GraniteDoclingHybridConfig
+
+    def _init_weights(self, module):
+        super()._init_weights(module)
+        # ``pos_embed_2d`` is a non-persistent buffer computed deterministically in
+        # ``GraniteDoclingHybridConnector.__init__``. ``from_pretrained`` runs the
+        # model through ``to_empty()`` before loading state_dict, which replaces
+        # buffer storage with uninitialized memory. Non-persistent buffers aren't
+        # in the checkpoint, so they keep that garbage unless we refill them here.
+        # Without this, every launch produces a different (often NaN-laden) pos_embed,
+        # making generation non-deterministic and frequently catastrophic.
+        if isinstance(module, GraniteDoclingHybridConnector) and module.pooling_mode == "pixel_shuffle_mlp_v2":
+            pos_embed = _build_2d_sincos_pos_embed(
+                module.pos_embed_2d.shape[-1], int(module.pos_embed_2d.shape[0] ** 0.5)
+            )
+            module.pos_embed_2d.data.copy_(pos_embed.to(module.pos_embed_2d.device))
+
+
+class GraniteDoclingHybridDeepStackMerger(nn.Module):
+    """Per-tap projector for Qwen3-VL-style DeepStack (Huang et al., arXiv:2406.04334).
+
+    Projects intermediate ViT features into LM embedding space via
+    ``pixel_shuffle -> LayerNorm -> Linear -> GELU -> Linear``. One instance is
+    created per entry of ``config.deepstack_visual_indexes``; each is independent
+    from the main modality projection used for the first-layer visual tokens.
+    """
+
+    def __init__(self, vision_hidden_size: int, scale_factor: int, text_hidden_size: int):
+        super().__init__()
+        self.scale_factor = scale_factor
+        merged_dim = vision_hidden_size * (scale_factor**2)
+        self.norm = nn.LayerNorm(merged_dim)
+        self.fc1 = nn.Linear(merged_dim, text_hidden_size)
+        self.act = nn.GELU()
+        self.fc2 = nn.Linear(text_hidden_size, text_hidden_size)
+
+    def pixel_shuffle(self, x: torch.Tensor) -> torch.Tensor:
+        bsz, seq, embed_dim = x.size()
+        height = width = int(seq**0.5)
+        x = x.reshape(bsz, height, width, embed_dim)
+        x = x.reshape(bsz, height, int(width / self.scale_factor), embed_dim * self.scale_factor)
+        x = x.permute(0, 2, 1, 3)
+        x = x.reshape(
+            bsz,
+            int(width / self.scale_factor),
+            int(height / self.scale_factor),
+            embed_dim * (self.scale_factor**2),
+        )
+        x = x.permute(0, 2, 1, 3)
+        x = x.reshape(bsz, int(seq / (self.scale_factor**2)), embed_dim * (self.scale_factor**2))
+        return x
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.pixel_shuffle(x.contiguous())
+        x = self.norm(x)
+        return self.fc2(self.act(self.fc1(x)))
+
+
+class GraniteDoclingHybridSimpleMLP(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        input_size = config.vision_config.hidden_size * (config.scale_factor**2)
+        output_size = config.text_config.hidden_size
+        self.proj = nn.Linear(input_size, output_size, bias=False)
+
+    def forward(self, x):
+        return self.proj(x)
+
+
+class GraniteDoclingHybridConnector(nn.Module):
+    """Modality projector matching nanoVLM's three ``mp_pooling_mode`` variants.
+
+    Modes (all share the same ``pixel_shuffle`` reshape rule and same ``proj`` Linear):
+
+    1. ``pixel_shuffle`` — ``pixel_shuffle -> proj``. Matches the stock Idefics3
+       connector behaviour and the original `Idefics3Connector` weight layout.
+    2. ``pixel_shuffle_mlp`` — adds a post-projection channel mix
+       ``-> GELU -> mlp_fc2`` in LM space (no LayerNorms, no positional embedding).
+    3. ``pixel_shuffle_mlp_v2`` — full MiniCPM-style resampler:
+       ``ln_in(vit_dim) -> pixel_shuffle -> proj -> + pos_embed_2d ->
+       ln_mid(lm_dim) -> GELU -> mlp_fc2 -> ln_out(lm_dim)``. The ``pos_embed_2d``
+       buffer is the same MAE-style 2D sincos table nanoVLM builds — registered
+       non-persistent so it doesn't bloat checkpoints; rebuilt at construction.
+
+    When ``config.use_deepstack`` is True, ``deepstack_mergers`` is an
+    ``nn.ModuleList`` of [`GraniteDoclingHybridDeepStackMerger`] — one per ViT
+    tap in ``config.deepstack_visual_indexes``. DeepStack is orthogonal to the
+    pooling mode; the merger has its own pre-projection LN.
+
+    Note on the seg-rate side channel: nanoVLM's v2 mode also accepts an
+    optional ``mp_use_seg_rate_embed`` toggle that adds a small ``Embedding(4,
+    lm_dim)`` lookup driven by a predicted compression map. That path requires
+    plumbing a compression map through ``forward`` and is intentionally not
+    mirrored here — bring it across if/when you need it.
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        self.scale_factor = config.scale_factor
+        self.modality_projection = GraniteDoclingHybridSimpleMLP(config)
+        self.pooling_mode = getattr(config, "mp_pooling_mode", "pixel_shuffle")
+
+        text_hidden_size = config.text_config.hidden_size
+        vision_hidden_size = config.vision_config.hidden_size
+
+        # ---- pixel_shuffle_mlp / pixel_shuffle_mlp_v2 channel-mix layer ----
+        self.mlp_fc2: nn.Linear | None = None
+        if self.pooling_mode in ("pixel_shuffle_mlp", "pixel_shuffle_mlp_v2"):
+            self.mlp_fc2 = nn.Linear(text_hidden_size, text_hidden_size, bias=False)
+
+        # ---- pixel_shuffle_mlp_v2 extras ----
+        self.ln_in: nn.LayerNorm | None = None
+        self.ln_mid: nn.LayerNorm | None = None
+        self.ln_out: nn.LayerNorm | None = None
+        if self.pooling_mode == "pixel_shuffle_mlp_v2":
+            self.ln_in = nn.LayerNorm(vision_hidden_size)
+            self.ln_mid = nn.LayerNorm(text_hidden_size)
+            self.ln_out = nn.LayerNorm(text_hidden_size)
+
+            # Within-tile 2D sincos. Grid side = sqrt(image_seq_len) where
+            # image_seq_len = (image_size // patch_size)^2 / scale_factor^2.
+            tokens_per_tile = (config.vision_config.image_size // config.vision_config.patch_size) ** 2 // (
+                config.scale_factor**2
+            )
+            grid_size = int(tokens_per_tile**0.5)
+            if grid_size * grid_size != tokens_per_tile:
+                raise ValueError(
+                    "image_seq_len must be a perfect square for pixel_shuffle_mlp_v2; "
+                    f"got {tokens_per_tile} (image_size={config.vision_config.image_size}, "
+                    f"patch_size={config.vision_config.patch_size}, scale_factor={config.scale_factor})."
+                )
+            pos_embed = _build_2d_sincos_pos_embed(text_hidden_size, grid_size)
+            self.register_buffer("pos_embed_2d", pos_embed, persistent=False)
+
+        self.deepstack_mergers: nn.ModuleList | None = None
+        if getattr(config, "use_deepstack", False):
+            self.deepstack_mergers = nn.ModuleList(
+                [
+                    GraniteDoclingHybridDeepStackMerger(
+                        config.vision_config.hidden_size,
+                        config.scale_factor,
+                        config.text_config.hidden_size,
+                    )
+                    for _ in config.deepstack_visual_indexes
+                ]
+            )
+
+    def pixel_shuffle(self, x, scale_factor=2):
+        bsz, seq, embed_dim = x.size()
+        height = width = int(seq**0.5)
+        x = x.view(bsz, height, width, embed_dim)
+        x = x.view(bsz, height, int(width / scale_factor), embed_dim * scale_factor)
+        x = x.permute(0, 2, 1, 3)
+        x = x.reshape(bsz, int(width / scale_factor), int(height / scale_factor), embed_dim * (scale_factor**2))
+        x = x.permute(0, 2, 1, 3)
+        x = x.reshape(bsz, int(seq / (scale_factor**2)), embed_dim * (scale_factor**2))
+        return x
+
+    def forward(self, image_hidden_states):
+        # The modular converter flattens `Idefics3Connector` inheritance into a direct
+        # nn.Module subclass, so we can't call `super().forward(...)` for the plain
+        # pixel_shuffle path — inline it instead.
+        if self.pooling_mode == "pixel_shuffle":
+            x = self.pixel_shuffle(image_hidden_states, self.scale_factor)
+            return self.modality_projection(x)
+
+        if self.pooling_mode == "pixel_shuffle_mlp":
+            x = self.pixel_shuffle(image_hidden_states, self.scale_factor)
+            x = self.modality_projection(x)
+            x = nn.functional.gelu(x)
+            x = self.mlp_fc2(x)
+            return x
+
+        # pixel_shuffle_mlp_v2
+        x = self.ln_in(image_hidden_states)
+        x = self.pixel_shuffle(x, self.scale_factor)
+        x = self.modality_projection(x)
+        x = x + self.pos_embed_2d.to(dtype=x.dtype)
+        x = self.ln_mid(x)
+        x = nn.functional.gelu(x)
+        x = self.mlp_fc2(x)
+        x = self.ln_out(x)
+        return x
+
+
+def rotate_half(x):
+    """Rotates half the hidden dims of the input."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+@use_kernel_func_from_hub("rotary_pos_emb")
+def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
+    """Applies Rotary Position Embedding to the query and key tensors.
+
+    Args:
+        q (`torch.Tensor`): The query tensor.
+        k (`torch.Tensor`): The key tensor.
+        cos (`torch.Tensor`): The cosine part of the rotary embedding.
+        sin (`torch.Tensor`): The sine part of the rotary embedding.
+        unsqueeze_dim (`int`, *optional*, defaults to 1):
+            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
+            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
+            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
+            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
+            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
+            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
+    Returns:
+        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
+    """
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
+
+
+def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """
+    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
+    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
+    """
+    batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+    if n_rep == 1:
+        return hidden_states
+    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
+    return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
+
+
+def eager_attention_forward(
+    module: nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    scaling: float,
+    dropout: float = 0.0,
+    **kwargs: Unpack[TransformersKwargs],
+):
+    key_states = repeat_kv(key, module.num_key_value_groups)
+    value_states = repeat_kv(value, module.num_key_value_groups)
+
+    attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
+    if attention_mask is not None:
+        attn_weights = attn_weights + attention_mask
+
+    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
+    attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
+    attn_output = torch.matmul(attn_weights, value_states)
+    attn_output = attn_output.transpose(1, 2).contiguous()
+
+    return attn_output, attn_weights
+
+
+@use_kernelized_func(apply_rotary_pos_emb)
+class GraniteDoclingHybridTextAttention(nn.Module):
+    """Multi-headed attention from 'Attention Is All You Need' paper"""
+
+    def __init__(self, config: GraniteDoclingHybridTextConfig, layer_idx: int):
+        super().__init__()
+        self.config = config
+        self.layer_idx = layer_idx
+        self.head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
+        self.scaling = config.attention_multiplier  # Only diff with llama
+        self.attention_dropout = config.attention_dropout
+        self.is_causal = True
+
+        self.q_proj = nn.Linear(
+            config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias
+        )
+        self.k_proj = nn.Linear(
+            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
+        )
+        self.v_proj = nn.Linear(
+            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
+        )
+        self.o_proj = nn.Linear(
+            config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        past_key_values: Cache | None = None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,  # None or rope embeddings
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        input_shape = hidden_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, self.head_dim)
+
+        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+        if position_embeddings is not None:
+            cos, sin = position_embeddings
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+        if past_key_values is not None:
+            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
+
+        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
+            self.config._attn_implementation, eager_attention_forward
+        )
+
+        attn_output, attn_weights = attention_interface(
+            self,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling,
+            **kwargs,
+        )
+
+        attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+        attn_output = self.o_proj(attn_output)
+        return attn_output, attn_weights
+
+
+# Helper methods for segment sum computation
+
+
+def pad_tensor_by_size(input_tensor: torch.Tensor, pad_size: int):
+    """
+    Padding x tensor with `pad_size` on the seq_len dim (dim=1)
+
+    Assumes that we only have tensors of either size 4 or 3
+    """
+    pad_shape = (0, 0, 0, 0, 0, pad_size, 0, 0) if len(input_tensor.shape) == 4 else (0, 0, 0, pad_size, 0, 0)
+
+    return torch.nn.functional.pad(input_tensor, pad_shape, mode="constant", value=0)
+
+
+def reshape_into_chunks(input_tensor, pad_size, chunk_size):
+    """
+    Padding input_tensor with `pad_size` on the seq_len dim (dim=1) and
+    simultaneously splitting it into chunk sequences.
+
+    Assumes that we only have tensors of either size 4 or 3
+    """
+    # [bsz, seq_len, ...] -> [bsz, seq_len multiple of chunk_size, ...]
+    input_tensor = pad_tensor_by_size(input_tensor, pad_size)
+
+    if len(input_tensor.shape) == 3:
+        # [bsz, seq_len multiple of chunk_size, num_heads] -> [bsz, -1, chunk_size, num_heads]
+        return input_tensor.reshape(input_tensor.shape[0], -1, chunk_size, input_tensor.shape[2])
+    else:
+        # [bsz, seq_len multiple of chunk_size, num_heads, head_dim or state_size] -> [bsz, -1, chunk_size, num_heads, head_dim or state_size]
+        return input_tensor.reshape(
+            input_tensor.shape[0], -1, chunk_size, input_tensor.shape[2], input_tensor.shape[3]
+        )
+
+
+def segment_sum(input_tensor):
+    """
+    More stable segment sum calculation. Uses cumulative sums and masking instead of direct subtractions.
+    """
+    chunk_size = input_tensor.size(-1)
+    # 1. expand input tensor to have an additional dimension and repeat along that dimension
+    # [..., chunk_size] -> [..., chunk_size, chunk_size]
+    input_tensor = input_tensor[..., None].expand(*input_tensor.size(), chunk_size)
+    # 2. create a lower triangular mask with the diagonal set to 0 to 0 out elements above diag
+    mask = torch.tril(torch.ones(chunk_size, chunk_size, device=input_tensor.device, dtype=torch.bool), diagonal=-1)
+    input_tensor = input_tensor.masked_fill(~mask, 0)
+    # 3. compute actual cumsum
+    tensor_segsum = torch.cumsum(input_tensor, dim=-2)
+
+    # 4. apply mask to keep only the lower triangular part of the cumulative sum result (incl diagonal this time)
+    mask = torch.tril(torch.ones(chunk_size, chunk_size, device=input_tensor.device, dtype=torch.bool), diagonal=0)
+    tensor_segsum = tensor_segsum.masked_fill(~mask, -torch.inf)
+    return tensor_segsum
+
+
+def apply_mask_to_padding_states(hidden_states, attention_mask):
+    """
+    Tunes out the hidden states for padding tokens, see https://github.com/state-spaces/mamba/issues/66
+    """
+    # NOTE: attention mask is a 2D boolean tensor
+    if attention_mask is not None and attention_mask.shape[1] > 1 and attention_mask.shape[0] > 1:
+        dtype = hidden_states.dtype
+        hidden_states = (hidden_states * attention_mask[:, :, None]).to(dtype)
+
+    return hidden_states
+
+
+class GraniteDoclingHybridTextRMSNormGated(torch.nn.Module):
+    def __init__(self, hidden_size, eps=1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states, gate=None):
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+
+        if gate is not None:
+            hidden_states = hidden_states * nn.functional.silu(gate.to(torch.float32))
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+
+        return self.weight * hidden_states.to(input_dtype)
+
+
+# Adapted from transformers.models.mamba2.modeling_mamba2.Mamba2Mixer
+class GraniteDoclingHybridTextMambaLayer(nn.Module):
+    """
+    Compute ∆, A, B, C, and D the state space parameters and compute the `contextualized_states`.
+    A, D are input independent (see Mamba paper [1] Section 3.5.2 "Interpretation of A" for why A isn't selective)
+    ∆, B, C are input-dependent (this is a key difference between Mamba and the linear time invariant S4,
+    and is why Mamba is called **selective** state spaces)
+
+    The are a few differences between this and Mamba2Mixer:
+    - The variable use_precomputed_states is slightly different due to the hybrid cache structure
+    - There's a few non-obvious bugs fixed with batching in the slow path that exist in main
+    - Some extra variables that our layer doesn't need have been removed
+    - We ported most of the refactors in https://github.com/huggingface/transformers/pull/35154, which is (as of Dec 18, 2024) unmerged
+    """
+
+    def __init__(self, config: GraniteDoclingHybridTextConfig, layer_idx: int):
+        super().__init__()
+        self.num_heads = config.mamba_n_heads
+        self.hidden_size = config.hidden_size
+        self.ssm_state_size = config.mamba_d_state
+        self.conv_kernel_size = config.mamba_d_conv
+        self.intermediate_size = int(config.mamba_expand * self.hidden_size)
+        self.layer_idx = layer_idx
+        self.use_conv_bias = config.mamba_conv_bias
+        self.activation = config.hidden_act
+        self.act = ACT2FN[config.hidden_act]
+        self.use_bias = config.mamba_proj_bias
+
+        self.layer_norm_epsilon = config.rms_norm_eps
+
+        self.n_groups = config.mamba_n_groups
+        self.head_dim = config.mamba_d_head
+        self.chunk_size = config.mamba_chunk_size
+
+        self.time_step_limit = config.time_step_limit
+        self.time_step_min = config.time_step_min
+        self.time_step_max = config.time_step_max
+
+        self.conv_dim = self.intermediate_size + 2 * self.n_groups * self.ssm_state_size
+        self.conv1d = nn.Conv1d(
+            in_channels=self.conv_dim,
+            out_channels=self.conv_dim,
+            bias=config.mamba_conv_bias,
+            kernel_size=self.conv_kernel_size,
+            groups=self.conv_dim,
+            padding=self.conv_kernel_size - 1,
+        )
+
+        # projection of the input hidden states
+        projection_size = self.intermediate_size + self.conv_dim + self.num_heads
+        self.in_proj = nn.Linear(
+            self.hidden_size,
+            projection_size,
+            bias=self.use_bias,
+        )
+        # selective projection used to make dt, B and C input dependent
+
+        # time step projection (discretization)
+        # instantiate once and copy inv_dt in init_weights of PretrainedModel
+        self.dt_bias = nn.Parameter(torch.ones(self.num_heads))
+
+        # S4D real initialization. These are not discretized!
+        # The core is to load them, compute the discrete states, then write the updated state. Keeps the memory bounded
+        A = torch.arange(1, self.num_heads + 1)
+        self.A_log = nn.Parameter(torch.log(A))
+        self.norm = GraniteDoclingHybridTextRMSNormGated(self.intermediate_size, eps=self.layer_norm_epsilon)
+        self.D = nn.Parameter(torch.ones(self.num_heads))
+
+        self.out_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=self.use_bias)
+
+        global causal_conv1d_update, causal_conv1d_fn
+        causal_conv1d = lazy_load_kernel("causal-conv1d")
+        causal_conv1d_update = getattr(causal_conv1d, "causal_conv1d_update", None)
+        causal_conv1d_fn = getattr(causal_conv1d, "causal_conv1d_fn", None)
+
+        global selective_state_update, mamba_chunk_scan_combined, mamba_split_conv1d_scan_combined
+        mamba_ssm = lazy_load_kernel("mamba-ssm")
+        selective_state_update = resolve_internal_import(
+            mamba_ssm, chained_path="ops.triton.selective_state_update.selective_state_update"
+        )
+        mamba_chunk_scan_combined = resolve_internal_import(
+            mamba_ssm, chained_path="ops.triton.ssd_combined.mamba_chunk_scan_combined"
+        )
+        mamba_split_conv1d_scan_combined = resolve_internal_import(
+            mamba_ssm, chained_path="ops.triton.ssd_combined.mamba_split_conv1d_scan_combined"
+        )
+
+        global is_fast_path_available
+        is_fast_path_available = all(
+            (
+                selective_state_update,
+                mamba_chunk_scan_combined,
+                mamba_split_conv1d_scan_combined,
+                causal_conv1d_fn,
+                causal_conv1d_update,
+            )
+        )
+
+        if not is_fast_path_available:
+            logger.warning_once(
+                "The fast path is not available because one of `(selective_state_update, causal_conv1d_fn, causal_conv1d_update)`"
+                " is None. Falling back to the naive implementation. To install follow https://github.com/state-spaces/mamba/#installation and"
+                " https://github.com/Dao-AILab/causal-conv1d"
+            )
+        else:
+            logger.warning_once(
+                "The fast path for GraniteDoclingHybridText will be used when running the model on a GPU"
+            )
+
+    def cuda_kernels_forward(
+        self,
+        hidden_states: torch.Tensor,
+        cache_params: HybridMambaAttentionDynamicCache | None = None,
+        attention_mask: torch.Tensor | None = None,
+        seq_idx: torch.IntTensor | None = None,
+    ):
+        # 1. Gated MLP's linear projection
+        hidden_states = apply_mask_to_padding_states(hidden_states, attention_mask)
+        projected_states = self.in_proj(hidden_states)
+
+        # Set up dimensions for reshapes later
+        batch_size, seq_len, _ = hidden_states.shape
+        groups_time_state_size = self.n_groups * self.ssm_state_size
+
+        use_precomputed_states = (
+            cache_params is not None
+            and cache_params.has_previous_state
+            and seq_len == 1
+            and cache_params.conv_states[self.layer_idx].shape[0]
+            == cache_params.ssm_states[self.layer_idx].shape[0]
+            == batch_size
+        )
+
+        # getting projected states from cache if it exists
+        if use_precomputed_states:
+            gate, hidden_states_B_C, dt = projected_states.squeeze(1).split(
+                [self.intermediate_size, self.conv_dim, self.num_heads], dim=-1
+            )
+
+            # 2. Convolution sequence transformation
+            hidden_states_B_C = causal_conv1d_update(
+                hidden_states_B_C,
+                cache_params.conv_states[self.layer_idx],
+                self.conv1d.weight.squeeze(1),
+                self.conv1d.bias,
+                self.activation,
+            )
+
+            hidden_states, B, C = torch.split(
+                hidden_states_B_C,
+                [self.intermediate_size, groups_time_state_size, groups_time_state_size],
+                dim=-1,
+            )
+
+            # 3. SSM transformation
+            A = -torch.exp(self.A_log.float())  # (nheads,)
+            A = A[:, None, ...][:, :, None].expand(-1, self.head_dim, self.ssm_state_size).to(dtype=torch.float32)
+            dt = dt[:, :, None].expand(-1, -1, self.head_dim)
+            dt_bias = self.dt_bias[:, None, ...].expand(-1, self.head_dim)
+            D = self.D[:, None, ...].expand(-1, self.head_dim)
+            B = B.view(batch_size, self.n_groups, B.shape[1] // self.n_groups)
+            C = C.view(batch_size, self.n_groups, C.shape[1] // self.n_groups)
+            hidden_states_reshaped = hidden_states.view(batch_size, self.num_heads, self.head_dim)
+            hidden_states = selective_state_update(
+                cache_params.ssm_states[self.layer_idx],
+                hidden_states_reshaped,
+                dt,
+                A,
+                B,
+                C,
+                D,
+                z=None,
+                dt_bias=dt_bias,
+                dt_softplus=True,
+            )
+            hidden_states = hidden_states.view(batch_size, self.num_heads * self.head_dim)
+            hidden_states = self.norm(hidden_states, gate)
+
+            # 4. Final linear projection
+            out = self.out_proj(hidden_states)[:, None, ...]
+        # Fused calculations or step by step if no initialized cache is found
+        else:
+            A = -torch.exp(self.A_log.float())  # (num_heads) or (intermediate_size, state_size)
+            dt_limit_kwargs = {} if self.time_step_limit == (0.0, float("inf")) else {"dt_limit": self.time_step_limit}
+
+            # 2-4. Fused kernel for conv1d, SSM, and the final projection
+            if self.training and cache_params is None:
+                out = mamba_split_conv1d_scan_combined(
+                    projected_states,
+                    self.conv1d.weight.squeeze(1),
+                    self.conv1d.bias,
+                    self.dt_bias,
+                    A,
+                    D=self.D,
+                    chunk_size=self.chunk_size,
+                    seq_idx=seq_idx,
+                    activation=self.activation,
+                    rmsnorm_weight=self.norm.weight,
+                    rmsnorm_eps=self.norm.variance_epsilon,
+                    outproj_weight=self.out_proj.weight,
+                    outproj_bias=self.out_proj.bias,
+                    headdim=self.head_dim,
+                    ngroups=self.n_groups,
+                    norm_before_gate=False,
+                    return_final_states=False,
+                    **dt_limit_kwargs,
+                )
+
+            else:
+                gate, hidden_states_B_C, dt = projected_states.split(
+                    [self.intermediate_size, self.conv_dim, self.num_heads], dim=-1
+                )
+
+                # 2. Convolution sequence transformation
+                # Init cache
+                if cache_params is not None:
+                    # storing the states
+                    # If we just take xBC[:, :, -self.d_conv :], it will error if seqlen < self.d_conv
+                    # Instead F.pad will pad with zeros if seqlen < self.d_conv, and truncate otherwise.
+                    hidden_states_B_C_transposed = hidden_states_B_C.transpose(1, 2)
+                    conv_states = nn.functional.pad(
+                        hidden_states_B_C_transposed,
+                        (self.conv_kernel_size - hidden_states_B_C_transposed.shape[-1], 0),
+                    )
+                    cache_params.conv_states[self.layer_idx].copy_(conv_states)
+
+                if self.activation not in ["silu", "swish"]:
+                    hidden_states_B_C = self.act(
+                        self.conv1d(hidden_states_B_C.transpose(1, 2))[..., :seq_len].transpose(1, 2)
+                    )
+                else:
+                    hidden_states_B_C = causal_conv1d_fn(
+                        x=hidden_states_B_C.transpose(1, 2),
+                        weight=self.conv1d.weight.squeeze(1),
+                        bias=self.conv1d.bias,
+                        activation=self.activation,
+                        seq_idx=seq_idx,
+                    ).transpose(1, 2)
+
+                hidden_states_B_C = apply_mask_to_padding_states(hidden_states_B_C, attention_mask)
+                hidden_states, B, C = torch.split(
+                    hidden_states_B_C,
+                    [self.intermediate_size, groups_time_state_size, groups_time_state_size],
+                    dim=-1,
+                )
+
+                # 3. SSM transformation
+                scan_output, ssm_state = mamba_chunk_scan_combined(
+                    hidden_states.view(batch_size, seq_len, -1, self.head_dim),
+                    dt,
+                    A,
+                    B.view(batch_size, seq_len, self.n_groups, -1),
+                    C.view(batch_size, seq_len, self.n_groups, -1),
+                    chunk_size=self.chunk_size,
+                    D=self.D,
+                    z=None,
+                    seq_idx=seq_idx,
+                    return_final_states=True,
+                    dt_bias=self.dt_bias,
+                    dt_softplus=True,
+                    **dt_limit_kwargs,
+                )
+
+                # Init cache
+                if ssm_state is not None and cache_params is not None:
+                    cache_params.ssm_states[self.layer_idx].copy_(ssm_state)
+
+                scan_output = scan_output.view(batch_size, seq_len, -1)
+                # Multiply "gate" branch and apply extra normalization layer
+                scan_output = self.norm(scan_output, gate)
+
+                # 4. Final linear projection
+                out = self.out_proj(scan_output)
+        return out
+
+    # fmt: off
+    def torch_forward(
+        self,
+        input_states,
+        cache_params: HybridMambaAttentionDynamicCache | None = None,
+        attention_mask: torch.Tensor | None = None,
+    ):
+        batch_size, seq_len, _ = input_states.shape
+        dtype = input_states.dtype
+
+        # 1. Gated MLP's linear projection
+        input_states = apply_mask_to_padding_states(input_states, attention_mask)
+        projected_states = self.in_proj(input_states)
+        gate, hidden_states_B_C, dt = projected_states.split(
+                [self.intermediate_size, self.conv_dim, self.num_heads], dim=-1
+        )
+
+        use_precomputed_states = (
+            cache_params is not None
+            and cache_params.has_previous_state
+            and seq_len == 1
+            and cache_params.conv_states[self.layer_idx].shape[0]
+            == cache_params.ssm_states[self.layer_idx].shape[0]
+            == batch_size
+        )
+
+        # 2. Convolution sequence transformation
+        if use_precomputed_states:
+            cache_params.conv_states[self.layer_idx] = cache_params.conv_states[self.layer_idx].roll(shifts=-1, dims=-1)
+            cache_params.conv_states[self.layer_idx][:, :, -1] = hidden_states_B_C[:, 0, :].to(cache_params.conv_states[self.layer_idx].device)
+
+            # We need to guarantee that anything regarding the cache is on the same device
+            conv_states = cache_params.conv_states[self.layer_idx].to(device=self.conv1d.weight.device)
+
+            hidden_states_B_C = torch.sum(
+                conv_states * self.conv1d.weight.squeeze(1), dim=-1
+            )
+            if self.use_conv_bias:
+                hidden_states_B_C = hidden_states_B_C + self.conv1d.bias
+            hidden_states_B_C = self.act(hidden_states_B_C)
+        else:
+            # Init cache
+            if cache_params is not None:
+                hidden_states_B_C_transposed = hidden_states_B_C.transpose(1, 2)
+                conv_states = nn.functional.pad(
+                    hidden_states_B_C_transposed, (self.conv_kernel_size - hidden_states_B_C_transposed.shape[-1], 0)
+                )
+                cache_params.conv_states[self.layer_idx].copy_(conv_states)
+
+            hidden_states_B_C = self.act(self.conv1d(hidden_states_B_C.transpose(1, 2))[..., :seq_len].transpose(1, 2))
+
+        hidden_states_B_C = apply_mask_to_padding_states(hidden_states_B_C, attention_mask)
+        hidden_states, B, C = torch.split(
+            hidden_states_B_C,
+            [self.intermediate_size, self.n_groups * self.ssm_state_size, self.n_groups * self.ssm_state_size],
+            dim=-1
+        )
+
+        # 3. SSM transformation
+        A = -torch.exp(self.A_log.float())                            # [num_heads]
+        if use_precomputed_states:
+            # We need to guarantee that anything regarding the cache is on the same device
+            cache_device = cache_params.ssm_states[self.layer_idx].device
+
+            # Note: there is no need to pad parameter matrices here, as there is just one new token
+            # for batched generation
+            dt = dt[:, 0, :][:, None, ...]
+            dt = dt.transpose(1, 2).expand(batch_size, dt.shape[-1], self.head_dim)
+            # [num_heads] -> [num_heads, head_dim]
+            dt_bias = self.dt_bias[..., None].expand(self.dt_bias.shape[0], self.head_dim)
+
+            dt = torch.nn.functional.softplus(dt + dt_bias.to(dt.dtype))
+            dt = torch.clamp(dt, self.time_step_limit[0], self.time_step_limit[1])
+            A = A[..., None, None].expand(self.num_heads, self.head_dim, self.ssm_state_size).to(dtype=torch.float32)
+            # [bsz, num_heads, head_dim, state_size]
+            dA = (torch.exp(dt[..., None] * A)).to(device=cache_device)
+
+            # Discretize B
+            # [bsz, n_groups * state_size] -> [bsz, n_groups, 1, state_size] ->
+            # -> [bsz, n_groups, group to head repetition factor, state_size] -> [bsz, num_heads, state_size]
+            B = B.reshape(batch_size, self.n_groups, -1)[..., None, :]
+            B = B.expand(batch_size, self.n_groups, self.num_heads // self.n_groups, B.shape[-1]).contiguous()
+            B = B.reshape(batch_size, -1, B.shape[-1])
+            # [bsz, num_heads, head_dim, state_size]
+            dB = dt[..., None] * B[..., None, :]
+
+            # Discretize x into dB
+            # [bsz, intermediate_size] -> [bsz, num_heads, head_dim]
+            hidden_states = hidden_states.reshape(batch_size, -1, self.head_dim)
+            dBx = (dB * hidden_states[..., None]).to(device=cache_device)
+
+            # State calculation
+            cache_params.ssm_states[self.layer_idx].copy_(
+                cache_params.ssm_states[self.layer_idx] * dA + dBx
+            )
+
+            # Subsequent output
+            # [bsz, n_groups * state_size] -> [bsz, num_heads, state_size]
+            C = C.reshape(batch_size, self.n_groups, -1)[..., None, :]
+            C = C.expand(batch_size, self.n_groups, self.num_heads // self.n_groups, C.shape[-1]).contiguous()
+            C = C.reshape(batch_size, -1, C.shape[-1])
+            # [bsz, num_heads, head_dim]
+
+            ssm_states = cache_params.ssm_states[self.layer_idx].to(device=C.device, dtype=C.dtype)  # Shape: [b, h, d, n]
+            # Reshape ssm_states to merge the first two dimensions
+            ssm_states_reshaped = ssm_states.view(batch_size * self.num_heads, self.head_dim, self.ssm_state_size)  # Shape: [b*h, d, n]
+            C_reshaped = C.view(batch_size * self.num_heads, self.ssm_state_size, 1)  # Shape: [b*h, n, 1]
+            y = torch.bmm(ssm_states_reshaped, C_reshaped)
+            y = y.view(batch_size, self.num_heads, self.head_dim)
+
+            # D skip connection
+            # [num_heads] -> [num_heads, head_dim]
+            D = self.D[..., None].expand(self.D.shape[0], self.head_dim)
+            y = (y + hidden_states * D).to(y.dtype)
+
+            # [bsz, num_heads, head_dim] -> [bsz, 1, intermediate_size]
+            y = y.reshape(batch_size, -1)[:, None, ...]
+        else:
+            # begin ssd naive implementation without einsums
+            dt = nn.functional.softplus(dt + self.dt_bias)
+            dt = torch.clamp(dt, self.time_step_limit[0], self.time_step_limit[1])
+            hidden_states = hidden_states.reshape(batch_size, seq_len, -1, self.head_dim).float()
+            B = B.reshape(batch_size, seq_len, -1, self.ssm_state_size).float()
+            C = C.reshape(batch_size, seq_len, -1, self.ssm_state_size).float()
+            B = B.repeat_interleave(self.num_heads // self.n_groups, dim=2, output_size=self.num_heads)
+            C = C.repeat_interleave(self.num_heads // self.n_groups, dim=2, output_size=self.num_heads)
+            pad_size = (self.chunk_size - seq_len % self.chunk_size) % self.chunk_size
+
+            D_residual = self.D[..., None] * pad_tensor_by_size(hidden_states, pad_size)
+
+            # Discretize x and A
+            hidden_states = hidden_states * dt[..., None]
+            A = A.to(hidden_states.dtype) * dt
+
+            # Rearrange into blocks/chunks
+            hidden_states, A, B, C = [reshape_into_chunks(t, pad_size, self.chunk_size) for t in (hidden_states, A, B, C)]
+
+            # [bsz, -1, chunk_size, num_heads] -> [bsz, num_heads, -1, chunk_size]
+            A = A.permute(0, 3, 1, 2)
+            A_cumsum = torch.cumsum(A, dim=-1)
+
+            # 1. Compute the output for each intra-chunk (diagonal blocks)
+            # This is the analog of a causal mask
+            L = torch.exp(segment_sum(A))
+
+            # Contraction of C and B to get G (attention-weights like)
+            G_intermediate = C[:, :, :, None, :, :] * B[:, :, None, :, :, :]  # shape: (b, c, l, s, h, n)
+            G = G_intermediate.sum(dim=-1)  # shape: (b, c, l, s, h)
+
+            # Compute M, equivalent to applying attention mask to weights
+            M_intermediate = G[..., None] * L.permute(0, 2, 3, 4, 1)[..., None]
+            M = M_intermediate.sum(dim=-1)
+
+            # Compute Y_diag (apply to values)
+            Y_diag = (M[..., None] * hidden_states[:, :, None]).sum(dim=3)
+
+            # 2. Compute the state for each intra-chunk
+            # (right term of low-rank factorization of off-diagonal blocks; B terms)
+            decay_states = torch.exp(A_cumsum[:, :, :, -1:] - A_cumsum)
+            B_decay = B * decay_states.permute(0, -2, -1, 1)[..., None]
+            states = (B_decay[..., None, :] * hidden_states[..., None]).sum(dim=2)
+
+            # 3. Compute the inter-chunk SSM recurrence; produces correct SSM states at chunk boundaries
+            # (middle term of factorization of off-diag blocks; A terms)
+            if use_precomputed_states:
+                previous_states = cache_params.ssm_states[self.layer_idx][:, None, ...].to(device=states.device)
+            else:
+                previous_states = torch.zeros_like(states[:, :1])
+            states = torch.cat([previous_states, states], dim=1)
+            decay_chunk = torch.exp(segment_sum(nn.functional.pad(A_cumsum[:, :, :, -1], (1, 0))))
+            decay_chunk = decay_chunk.transpose(1, 3)
+            new_states = (decay_chunk[..., None, None] * states[:, :, None, ...]).sum(dim=1)
+            states, ssm_state = new_states[:, :-1], new_states[:, -1]
+
+            # 4. Compute state -> output conversion per chunk
+            # (left term of low-rank factorization of off-diagonal blocks; C terms)
+            state_decay_out = torch.exp(A_cumsum)
+            C_times_states = (C[..., None, :] * states[:, :, None, ...])
+            state_decay_out_permuted = state_decay_out.permute(0, 2, 3, 1)
+            Y_off = (C_times_states.sum(-1) * state_decay_out_permuted[..., None])
+
+            # Add output of intra-chunk and inter-chunk terms (diagonal and off-diagonal blocks)
+            y = Y_diag + Y_off
+            # [bsz, -1, self.chunk_size, num_heads, head_dim] -> [bsz, (padded) seq_len, num_heads, head_dim]
+            y = y.reshape(batch_size, -1, self.num_heads, self.head_dim)
+
+            y = y + D_residual
+            # Cutting off padded chunks
+            if pad_size > 0:
+                y = y[:, :seq_len, :, :]
+            y = y.reshape(batch_size, seq_len, -1)
+
+            # Init cache
+            if ssm_state is not None and cache_params is not None:
+                cache_params.ssm_states[self.layer_idx].copy_(ssm_state)
+
+        scan_output = self.norm(y, gate)
+
+        # end ssd naive
+
+        # 4. Final linear projection
+        contextualized_states = self.out_proj(scan_output.to(dtype))  # [batch, seq_len, hidden_size]
+        return contextualized_states
+    # fmt: on
+
+    def forward(
+        self,
+        hidden_states,
+        cache_params: HybridMambaAttentionDynamicCache | None = None,
+        attention_mask: torch.Tensor | None = None,
+        seq_idx: torch.IntTensor | None = None,
+        **kwargs,
+    ):
+        if is_fast_path_available and "cuda" in self.in_proj.weight.device.type and not is_torchdynamo_compiling():
+            return self.cuda_kernels_forward(hidden_states, cache_params, attention_mask, seq_idx)
+        if seq_idx is not None:
+            raise NotImplementedError(
+                "`seq_idx` support requires fast path support. Please install `mamba_ssm` and `causal_conv1d`"
+            )
+        dtype = hidden_states.dtype
+        if attention_mask is not None and attention_mask.shape[1] > 1 and attention_mask.shape[0] > 1:
+            # tune out hidden states for pad tokens, see https://github.com/state-spaces/mamba/issues/66
+            hidden_states = (hidden_states * attention_mask[:, :, None]).to(dtype)
+
+        return self.torch_forward(hidden_states, cache_params, attention_mask)
+
+
+class GraniteDoclingHybridTextMLP(nn.Module):
+    """
+    MLP layer for shared experts
+
+    Args:
+        config:
+            Configuration object with model hyperparameters.
+    """
+
+    def __init__(self, config: GraniteDoclingHybridTextConfig):
+        super().__init__()
+
+        self.input_size = config.hidden_size
+        self.hidden_size = config.shared_intermediate_size
+        self.activation = ACT2FN[config.hidden_act]
+        self.input_linear = nn.Linear(self.input_size, self.hidden_size * 2, bias=False)
+        self.output_linear = nn.Linear(self.hidden_size, self.input_size, bias=False)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states = self.input_linear(hidden_states)
+        chunked_hidden_states = hidden_states.chunk(2, dim=-1)
+        hidden_states = self.activation(chunked_hidden_states[0]) * chunked_hidden_states[1]
+        hidden_states = self.output_linear(hidden_states)
+        return hidden_states
+
+
+class GraniteDoclingHybridTextRotaryEmbedding(nn.Module):
+    inv_freq: torch.Tensor  # fix linting for `register_buffer`
+
+    def __init__(self, config: GraniteDoclingHybridTextConfig, device=None):
+        super().__init__()
+        self.max_seq_len_cached = config.max_position_embeddings
+        self.original_max_seq_len = config.max_position_embeddings
+
+        self.config = config
+
+        self.rope_type = self.config.rope_parameters["rope_type"]
+        rope_init_fn: Callable = self.compute_default_rope_parameters
+        if self.rope_type != "default":
+            rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+        inv_freq, self.attention_scaling = rope_init_fn(self.config, device)
+
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.register_buffer("original_inv_freq", inv_freq.clone(), persistent=False)
+
+    @staticmethod
+    def compute_default_rope_parameters(
+        config: GraniteDoclingHybridTextConfig | None = None,
+        device: Optional["torch.device"] = None,
+        seq_len: int | None = None,
+    ) -> tuple["torch.Tensor", float]:
+        """
+        Computes the inverse frequencies according to the original RoPE implementation
+        Args:
+            config ([`~transformers.PreTrainedConfig`]):
+                The model configuration.
+            device (`torch.device`):
+                The device to use for initialization of the inverse frequencies.
+            seq_len (`int`, *optional*):
+                The current sequence length. Unused for this type of RoPE.
+        Returns:
+            Tuple of (`torch.Tensor`, `float`), containing the inverse frequencies for the RoPE embeddings and the
+            post-processing scaling factor applied to the computed cos/sin (unused in this type of RoPE).
+        """
+        base = config.rope_parameters["rope_theta"]
+        dim = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
+
+        attention_factor = 1.0  # Unused in this type of RoPE
+
+        # Compute the inverse frequencies
+        inv_freq = 1.0 / (
+            base ** (torch.arange(0, dim, 2, dtype=torch.int64).to(device=device, dtype=torch.float) / dim)
+        )
+        return inv_freq, attention_factor
+
+    @torch.no_grad()
+    @dynamic_rope_update  # power user: used with advanced RoPE types (e.g. dynamic rope)
+    def forward(self, x, position_ids):
+        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
+        position_ids_expanded = position_ids[:, None, :].float()
+
+        device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
+        with maybe_autocast(device_type=device_type, enabled=False):  # Force float32
+            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            cos = emb.cos() * self.attention_scaling
+            sin = emb.sin() * self.attention_scaling
+
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+
+
+class GraniteDoclingHybridTextParallelExperts(nn.Module):
+    def __init__(self, num_experts: int, input_size: int, output_size: int) -> None:
+        """
+        Initialize the GraniteDoclingHybridTextParallelExperts module.
+        The experts weights are stored in [num_experts, output_size, input_size] format. Such that it's compatible with
+        many MoE libraries, such as [Megablock](https://github.com/databricks/megablocks) and
+        [ScatterMoE](https://github.com/shawntan/scattermoe), as well as the
+        [MoE kernel](https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/fused_moe/fused_moe.py)
+        used in vllm.
+
+        Args:
+            num_experts (int):
+                Number of experts.
+            input_size (int):
+                Size of the input.
+            output_size (int):
+                Size of the output.
+        """
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(num_experts, output_size, input_size))
+        self.num_experts = num_experts
+        self.input_size = input_size
+        self.output_size = output_size
+
+    def forward(self, inputs, expert_size):
+        """
+        Forward pass of the GraniteDoclingHybridTextParallelExperts module.
+
+        Args:
+            inputs (Tensor):
+                Input tensor.
+            expert_size:
+                Expert size information.
+
+        Returns:
+            Tensor: Output tensor.
+        """
+        input_list = inputs.split(expert_size, dim=0)
+        output_list = []
+        for i in range(self.num_experts):
+            output_list.append(F.linear(input_list[i], self.weight[i]))
+        results = torch.cat(output_list, dim=0)
+        return results
+
+
+class GraniteDoclingHybridTextTopKGating(nn.Module):
+    def __init__(self, input_size: int, num_experts: int, top_k: int):
+        """
+        Initialize the top-k gating mechanism.
+
+        Args:
+            input_size (`int`):
+                Size of the input.
+            num_experts (`int`):
+                Number of experts.
+            top_k (`int`):
+                Number of top experts to select.
+        """
+        super().__init__()
+
+        self.num_experts = num_experts
+        self.input_size = input_size
+        self.top_k = top_k
+
+        self.layer = nn.Linear(input_size, num_experts, bias=False)
+
+    def forward(self, hidden_states):
+        # compute the top_k routing decision
+        logits = self.layer(hidden_states).float()  # [batch_size x seq_len, num_experts]
+        top_k_logits, top_k_indices = logits.topk(self.top_k, dim=1)  # [num_tokens, top_k]
+        top_k_gates = torch.softmax(top_k_logits, dim=1).type_as(hidden_states)  # [num_tokens, top_k]
+
+        # compute number of input given to each expert
+        zeros = torch.zeros(
+            [top_k_gates.size(0), self.num_experts], dtype=top_k_gates.dtype, device=top_k_gates.device
+        )  # [num_tokens, num_experts]
+        gates = zeros.scatter(1, top_k_indices, 1)  # [num_tokens, num_experts]
+        expert_size = gates.long().sum(0)  # [num_experts,]
+        # (This cause torch.compile to fail with `torch._dynamo.exc.Unsupported: Backend compiler failed with a fake tensor exception at`)
+        # (and `DataDependentOutputException`)
+        expert_size = expert_size.tolist()
+
+        # sort and group input tokens according to expert assignment
+        top_k_experts = top_k_indices.flatten()  # [num_tokens * top_k]
+        _, index_sorted_experts = top_k_experts.sort(0)  # [num_tokens * top_k]
+        batch_index = index_sorted_experts.div(self.top_k, rounding_mode="trunc")  # [num_tokens * top_k]
+
+        # gather the gate values for grouped input tokens
+        top_k_gates = top_k_gates.flatten()  # [num_tokens * top_k]
+        batch_gates = top_k_gates[index_sorted_experts]  # [num_tokens * top_k]
+
+        return index_sorted_experts, batch_index, batch_gates, expert_size, logits
+
+
+class GraniteDoclingHybridTextMoE(nn.Module):
+    """
+    A Sparsely gated mixture of experts layer with 1-layer Feed-Forward networks as experts.
+
+    Args:
+        config:
+            Configuration object with model hyperparameters.
+    """
+
+    def __init__(self, config: GraniteDoclingHybridTextConfig):
+        super().__init__()
+
+        self.input_size = config.hidden_size
+        self.hidden_size = config.intermediate_size
+        self.activation = ACT2FN[config.hidden_act]
+        self.input_linear = GraniteDoclingHybridTextParallelExperts(
+            config.num_local_experts, self.input_size, self.hidden_size * 2
+        )
+        self.output_linear = GraniteDoclingHybridTextParallelExperts(
+            config.num_local_experts, self.hidden_size, self.input_size
+        )
+
+        self.router = GraniteDoclingHybridTextTopKGating(
+            input_size=self.input_size,
+            num_experts=config.num_local_experts,
+            top_k=config.num_experts_per_tok,
+        )
+
+    def forward(self, layer_input):
+        bsz, length, emb_size = layer_input.size()
+        layer_input = layer_input.reshape(-1, emb_size)
+        _, batch_index, batch_gates, expert_size, _ = self.router(layer_input)
+
+        expert_inputs = layer_input[batch_index]
+        hidden_states = self.input_linear(expert_inputs, expert_size)
+        chunked_hidden_states = hidden_states.chunk(2, dim=-1)
+        hidden_states = self.activation(chunked_hidden_states[0]) * chunked_hidden_states[1]
+        expert_outputs = self.output_linear(hidden_states, expert_size)
+
+        expert_outputs = expert_outputs * batch_gates[:, None]
+
+        zeros = torch.zeros((bsz * length, self.input_size), dtype=expert_outputs.dtype, device=expert_outputs.device)
+        layer_output = zeros.index_add(0, batch_index, expert_outputs)
+        layer_output = layer_output.view(bsz, length, self.input_size)
+        return layer_output
+
+
+class GraniteFlashAttentionKwargs(TypedDict, total=False):
+    """
+    Keyword arguments for advanced Flash Attention, causal-conv1d, and mamba_ssm kernel usage.
+    Use cases include padding-free training and fewer `torch.compile` graph breaks.
+
+    cu_seq_lens_q (`torch.LongTensor`):
+        Gets cumulative sequence length for query state.
+    cu_seq_lens_k (`torch.LongTensor`):
+        Gets cumulative sequence length for key state.
+    max_length_q (`int`):
+        Maximum sequence length for query state.
+    max_length_k (`int`):
+        Maximum sequence length for key state.
+    seq_idx (`torch.IntTensor):
+        Index of each packed sequence.
+    """
+
+    cu_seq_lens_q: torch.LongTensor
+    cu_seq_lens_k: torch.LongTensor
+    max_length_q: int
+    max_length_k: int
+    seq_idx: torch.IntTensor
+
+
+@use_kernel_forward_from_hub("RMSNorm")
+class GraniteDoclingHybridTextRMSNorm(nn.Module):
+    def __init__(self, hidden_size, eps: float = 1e-6) -> None:
+        """
+        GraniteDoclingHybridTextRMSNorm is equivalent to T5LayerNorm
+        """
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        return self.weight * hidden_states.to(input_dtype)
+
+    def extra_repr(self):
+        return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
+
+
+class GraniteDoclingHybridTextDecoderLayer(GradientCheckpointingLayer):
+    def __init__(self, config: GraniteDoclingHybridTextConfig, layer_idx: int):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        # Either attention or mamba will be initialized, depending on the layer type.
+        self.self_attn = None
+        self.input_layernorm = GraniteDoclingHybridTextRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = GraniteDoclingHybridTextRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+        # Allow non-MoE (dense)
+        self.block_sparse_moe = GraniteDoclingHybridTextMoE(config) if config.num_local_experts > 0 else None
+        self.residual_multiplier = config.residual_multiplier  # Only diff with mixtral!
+        self.shared_mlp = GraniteDoclingHybridTextMLP(config)
+        self.mamba = None
+
+        if config.layers_block_type[layer_idx] == "mamba":
+            self.mamba = GraniteDoclingHybridTextMambaLayer(config, layer_idx)
+        else:
+            self.self_attn = GraniteDoclingHybridTextAttention(config, layer_idx)
+        self.layer_type = config.layers_block_type[layer_idx]
+
+        # Accept 0 experts: skip MoE if num_local_experts == 0
+        self.has_experts = getattr(config, "num_local_experts", 0) > 0
+
+    @auto_docstring
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        past_key_values: Cache | None = None,
+        use_cache: bool | None = False,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        **kwargs: Unpack[GraniteFlashAttentionKwargs],
+    ) -> tuple[torch.FloatTensor, tuple[torch.FloatTensor, torch.FloatTensor] | None]:
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+
+        if self.mamba is not None:
+            hidden_states = self.mamba(
+                hidden_states=hidden_states,
+                cache_params=past_key_values,
+                attention_mask=attention_mask,
+                **kwargs,
+            )
+        else:
+            hidden_states, _ = self.self_attn(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                position_embeddings=position_embeddings,
+                **kwargs,
+            )
+
+        hidden_states = residual + hidden_states * self.residual_multiplier
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+
+        if self.has_experts:
+            moe_hidden_states = self.block_sparse_moe(hidden_states)
+            hidden_states = moe_hidden_states + self.shared_mlp(hidden_states)
+        else:
+            hidden_states = self.shared_mlp(hidden_states)
+
+        hidden_states = residual + hidden_states * self.residual_multiplier
+        return hidden_states
+
+
+@auto_docstring
+class GraniteDoclingHybridTextPreTrainedModel(PreTrainedModel):
+    config: GraniteDoclingHybridTextConfig
+    base_model_prefix = "model"
+    supports_gradient_checkpointing = True
+    _no_split_modules = ["GraniteDoclingHybridTextDecoderLayer"]
+    _skip_keys_device_placement = ["past_key_values"]
+    _supports_flash_attn = True
+    _supports_sdpa = True
+    _supports_flex_attn = True
+    _can_compile_fullgraph = False  # TopK gating fails fullgraph compilation at "expert_size = expert_size.tolist()"
+    _supports_attention_backend = True
+    _can_record_outputs = {
+        "hidden_states": GraniteDoclingHybridTextDecoderLayer,
+        "attentions": GraniteDoclingHybridTextAttention,
+    }
+    _is_stateful = True
+
+    @torch.no_grad()
+    def _init_weights(self, module):
+        super()._init_weights(module)
+        if isinstance(module, GraniteDoclingHybridTextParallelExperts):
+            init.normal_(module.weight, mean=0.0, std=self.config.initializer_range)
+        if isinstance(module, GraniteDoclingHybridTextMambaLayer):
+            init.ones_(module.dt_bias)
+            init.copy_(module.A_log, torch.log(torch.arange(1, module.num_heads + 1)))
+            init.ones_(module.D)
+        elif isinstance(module, GraniteDoclingHybridTextRMSNormGated):
+            init.ones_(module.weight)
+
+
+@auto_docstring
+class GraniteDoclingHybridTextModel(GraniteDoclingHybridTextPreTrainedModel):
+    """GraniteMoeHybrid text model with optional DeepStack residual injection.
+
+    Equivalent to [`GraniteMoeHybridModel`] when DeepStack kwargs are not provided.
+    During prefill, accepts ``deepstack_visual_embeds`` (one per ViT tap) plus
+    ``visual_pos_masks`` and ``deepstack_attn_layers`` and, after each decoder
+    layer whose index appears in ``deepstack_attn_layers``, adds the corresponding
+    projected visual features to the hidden states at image-token positions only.
+    Text-token hidden states are untouched. See https://arxiv.org/abs/2406.04334.
+    """
+
+    def __init__(self, config: GraniteDoclingHybridTextConfig):
+        super().__init__(config)
+        self.padding_idx = config.pad_token_id
+        self.vocab_size = config.vocab_size
+
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        self.layers = nn.ModuleList(
+            [GraniteDoclingHybridTextDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+        )
+        self.norm = GraniteDoclingHybridTextRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.rotary_emb = (
+            GraniteDoclingHybridTextRotaryEmbedding(config) if config.position_embedding_type == "rope" else None
+        )
+        self.gradient_checkpointing = False
+        self.embedding_multiplier = config.embedding_multiplier
+
+        # Initialize weights and apply final processing
+        self.post_init()
+
+    @merge_with_config_defaults
+    @capture_outputs
+    def forward(
+        self,
+        input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        use_cache: bool | None = None,
+        visual_pos_masks: torch.Tensor | None = None,
+        deepstack_visual_embeds: list[torch.Tensor] | None = None,
+        deepstack_attn_layers: list[int] | None = None,
+        **kwargs: Unpack[GraniteFlashAttentionKwargs],
+    ) -> tuple | BaseModelOutputWithPast:
+        r"""
+        visual_pos_masks (`torch.Tensor` of shape `(batch_size, seq_len)`, *optional*):
+            Boolean mask marking image-token positions in the LM sequence. Only set during prefill;
+            None during the autoregressive decode steps (where no image tokens appear).
+        deepstack_visual_embeds (`list[torch.Tensor]`, *optional*):
+            One tensor per ViT tap, shape `(num_image_tokens, hidden_size)`. Slot `i` corresponds
+            to tap `deepstack_visual_indexes[i]` and is added at LM layer `deepstack_attn_layers[i]`.
+        deepstack_attn_layers (`list[int]`, *optional*):
+            LM decoder layer indices that receive each DeepStack tap. Same length as
+            `deepstack_visual_embeds`.
+        """
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids)
+
+        inputs_embeds = inputs_embeds * self.embedding_multiplier
+
+        if position_ids is None:
+            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+            position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen_tokens
+            position_ids = position_ids.unsqueeze(0)
+
+        causal_mask = create_causal_mask(
+            config=self.config,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+        )
+        mamba_mask = self._update_mamba_mask(attention_mask, past_key_values)
+
+        hidden_states = inputs_embeds
+        position_embeddings = None
+        if self.rotary_emb is not None:
+            position_embeddings = self.rotary_emb(hidden_states, position_ids)
+
+        # Index → slot map for O(1) lookup inside the layer loop.
+        deepstack_active = deepstack_visual_embeds is not None and deepstack_attn_layers is not None
+        ds_layer_to_slot: dict[int, int] = (
+            {layer_idx: slot for slot, layer_idx in enumerate(deepstack_attn_layers)} if deepstack_active else {}
+        )
+
+        for i, decoder_layer in enumerate(self.layers):
+            # Depending on the layer type we opt for 2D base attention mask (Mamba) or 4D causal mask (Attention)
+            layer_mask = mamba_mask if self.config.layers_block_type[i] == "mamba" else causal_mask
+
+            hidden_states = decoder_layer(
+                hidden_states,
+                attention_mask=layer_mask,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                position_embeddings=position_embeddings,
+                **kwargs,
+            )
+
+            # DeepStack residual injection at image-token positions. Restricted to prefill —
+            # `visual_pos_masks` is None during autoregressive decoding so we skip naturally.
+            if deepstack_active and visual_pos_masks is not None and i in ds_layer_to_slot:
+                slot = ds_layer_to_slot[i]
+                img_feats = deepstack_visual_embeds[slot].to(device=hidden_states.device, dtype=hidden_states.dtype)
+                pos_masks = visual_pos_masks.to(hidden_states.device)
+                hidden_states = hidden_states.clone()
+                hidden_states[pos_masks, :] = hidden_states[pos_masks, :] + img_feats
+
+        hidden_states = self.norm(hidden_states)
+
+        if past_key_values and not past_key_values.has_previous_state:
+            past_key_values.has_previous_state = True
+
+        return MoeModelOutputWithPast(
+            last_hidden_state=hidden_states,
+            past_key_values=past_key_values,
+        )
+
+    def _update_mamba_mask(self, attention_mask, past_key_values):
+        """
+        No need for zeroing states when
+            1. Cached forward
+            2. Attending to all inputs
+        """
+        mamba_mask = attention_mask
+        if (past_key_values is not None and past_key_values.has_previous_state) or (
+            attention_mask is not None and torch.all(attention_mask == 1)
+        ):
+            mamba_mask = None
+        return mamba_mask
 
 
 class GraniteDoclingHybridVisionEmbeddings(nn.Module):
@@ -305,29 +1768,6 @@ class GraniteDoclingHybridVisionEmbeddings(nn.Module):
 
         embeddings = embeddings + self.position_embedding(position_ids)
         return embeddings
-
-
-def eager_attention_forward(
-    module: nn.Module,
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    attention_mask: torch.Tensor | None,
-    scaling: float,
-    dropout: float = 0.0,
-    **kwargs,
-):
-    attn_weights = torch.matmul(query, key.transpose(-1, -2)) * scaling
-    if attention_mask is not None:
-        attn_weights = attn_weights + attention_mask
-
-    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query.dtype)
-    attn_weights = nn.functional.dropout(attn_weights, p=dropout, training=module.training)
-
-    attn_output = torch.matmul(attn_weights, value)
-    attn_output = attn_output.transpose(1, 2).contiguous()
-
-    return attn_output, attn_weights
 
 
 class GraniteDoclingHybridVisionAttention(nn.Module):
@@ -409,17 +1849,6 @@ class GraniteDoclingHybridVisionMLP(nn.Module):
         return hidden_states
 
 
-class GraniteDoclingHybridSimpleMLP(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        input_size = config.vision_config.hidden_size * (config.scale_factor**2)
-        output_size = config.text_config.hidden_size
-        self.proj = nn.Linear(input_size, output_size, bias=False)
-
-    def forward(self, x):
-        return self.proj(x)
-
-
 class GraniteDoclingHybridEncoderLayer(GradientCheckpointingLayer):
     def __init__(self, config: GraniteDoclingHybridVisionConfig):
         super().__init__()
@@ -490,29 +1919,6 @@ class GraniteDoclingHybridEncoder(nn.Module):
         return BaseModelOutput(last_hidden_state=hidden_states)
 
 
-class GraniteDoclingHybridConnector(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.scale_factor = config.scale_factor
-        self.modality_projection = GraniteDoclingHybridSimpleMLP(config)
-
-    def pixel_shuffle(self, x, scale_factor=2):
-        bsz, seq, embed_dim = x.size()
-        height = width = int(seq**0.5)
-        x = x.view(bsz, height, width, embed_dim)
-        x = x.view(bsz, height, int(width / scale_factor), embed_dim * scale_factor)
-        x = x.permute(0, 2, 1, 3)
-        x = x.reshape(bsz, int(width / scale_factor), int(height / scale_factor), embed_dim * (scale_factor**2))
-        x = x.permute(0, 2, 1, 3)
-        x = x.reshape(bsz, int(seq / (scale_factor**2)), embed_dim * (scale_factor**2))
-        return x
-
-    def forward(self, image_hidden_states):
-        image_hidden_states = self.pixel_shuffle(image_hidden_states, self.scale_factor)
-        image_hidden_states = self.modality_projection(image_hidden_states)
-        return image_hidden_states
-
-
 @auto_docstring(
     custom_intro="""
     The GraniteDoclingHybrid Vision Transformer Model outputting raw image embedding.
@@ -521,9 +1927,6 @@ class GraniteDoclingHybridConnector(nn.Module):
 class GraniteDoclingHybridVisionTransformer(GraniteDoclingHybridPreTrainedModel):
     config: GraniteDoclingHybridVisionConfig
     input_modalities = ("image",)
-    _supports_sdpa = True
-    _supports_flash_attn = True
-    _supports_flex_attn = True
     _can_record_outputs = {
         "hidden_states": GraniteDoclingHybridEncoderLayer,
         "attentions": GraniteDoclingHybridVisionAttention,
@@ -604,7 +2007,11 @@ class GraniteDoclingHybridModel(GraniteDoclingHybridPreTrainedModel):
 
         self.vision_model = GraniteDoclingHybridVisionTransformer._from_config(config.vision_config)
         self.connector = GraniteDoclingHybridConnector(config)
-        self.text_model = AutoModel.from_config(config.text_config)
+        # Replace the AutoModel-instantiated GraniteMoeHybridModel with our subclass that
+        # knows how to consume DeepStack kwargs and inject residuals between decoder layers.
+        # Re-running `_from_config` here is fine: the previous text_model is dropped before
+        # any forward pass and our `post_init` initialises weights identically.
+        self.text_model = GraniteDoclingHybridTextModel._from_config(config.text_config)
 
         self.image_seq_len = int(
             ((config.vision_config.image_size // config.vision_config.patch_size) ** 2) / (config.scale_factor**2)
@@ -652,61 +2059,86 @@ class GraniteDoclingHybridModel(GraniteDoclingHybridPreTrainedModel):
     def get_image_features(
         self,
         pixel_values: torch.FloatTensor,
-        pixel_attention_mask: torch.LongTensor | None = None,
-        **kwargs: Unpack[TransformersKwargs],
+        pixel_attention_mask=None,
+        **kwargs,
     ) -> tuple | BaseModelOutputWithPooling:
         r"""
         pixel_values (`torch.FloatTensor` of shape `(batch_size, num_channels, image_size, image_size)`):
             The tensors corresponding to the input images.
-        pixel_attention_mask (`torch.LongTensor`, *optional*):
+        pixel_attention_mask:
             Unused. GotOcr2ImageProcessor crops each tile to exactly the ViT input
             resolution, so every pixel is real — the mask is always all-ones.
             Kept in the signature for API compatibility only.
         """
         batch_size, num_images, num_channels, height, width = pixel_values.shape
         pixel_values = pixel_values.view(batch_size * num_images, *pixel_values.shape[2:])
+        # TODO: change
+        # Determine which sub-images are real vs zero-padding.
+        # Prefer the explicit mask from the processor (handles all-black tiles
+        # correctly); fall back to the pixel-value heuristic for backward compat.
+        if pixel_attention_mask is not None:
+            real_images_inds = pixel_attention_mask.view(-1).bool()
+        else:
+            nb_values_per_image = pixel_values.shape[1:].numel()
+            real_images_inds = (pixel_values == 0).sum(dim=(-1, -2, -3)) != nb_values_per_image
+        pixel_values = pixel_values[real_images_inds].contiguous()
 
         if pixel_values.dtype == torch.uint8:
             # Recipe ⑧ (Huang et al. 2026 §3.3): uint8 path — images were transferred as
             # 1 byte/pixel; rescale and normalize here on GPU to avoid CPU-side float ops
             # and reduce PCIe bandwidth 4× vs float32.
-            # Remove zero-padded image slots BEFORE cast (zero uint8 == zero float).
-            nb_values_per_image = pixel_values.shape[1:].numel()
-            real_images_inds = pixel_values.sum(dim=(-1, -2, -3)) != 0
-            # Edge case: all-black image is a real image (sum == 0). Fall back to padding
-            # detection only if at least one slot has non-zero pixels.
-            if not real_images_inds.all():
-                real_images_inds = (pixel_values == 0).sum(dim=(-1, -2, -3)) != nb_values_per_image
-            pixel_values = pixel_values[real_images_inds].contiguous()
-            # Cast and rescale to [0, 1] in model dtype (BF16 on GPU)
+            # TODO: change
+            # nb_values_per_image = pixel_values.shape[1:].numel()
+            # real_images_inds = pixel_values.sum(dim=(-1, -2, -3)) != 0
+            # if not real_images_inds.all():
+            #     real_images_inds = (pixel_values == 0).sum(dim=(-1, -2, -3)) != nb_values_per_image
+            # pixel_values = pixel_values[real_images_inds].contiguous()
             pixel_values = pixel_values.to(dtype=self.dtype) / 255.0
-            # Normalize: subtract mean, divide by std (values from vision_config)
             mean = torch.tensor(
                 self.config.vision_config.image_mean, dtype=self.dtype, device=pixel_values.device
             ).view(1, 3, 1, 1)
-            std = torch.tensor(
-                self.config.vision_config.image_std, dtype=self.dtype, device=pixel_values.device
-            ).view(1, 3, 1, 1)
+            std = torch.tensor(self.config.vision_config.image_std, dtype=self.dtype, device=pixel_values.device).view(
+                1, 3, 1, 1
+            )
             pixel_values = (pixel_values - mean) / std
         else:
             # Float path (backward-compatible): image was pre-normalized by the processor.
             pixel_values = pixel_values.to(dtype=self.dtype)
-            nb_values_per_image = pixel_values.shape[1:].numel()
-            real_images_inds = (pixel_values == 0.0).sum(dim=(-1, -2, -3)) != nb_values_per_image
-            pixel_values = pixel_values[real_images_inds].contiguous()
+            # TODO: change
+            # nb_values_per_image = pixel_values.shape[1:].numel()
+            # real_images_inds = (pixel_values == 0.0).sum(dim=(-1, -2, -3)) != nb_values_per_image
+            # pixel_values = pixel_values[real_images_inds].contiguous()
 
         # GotOcr2ImageProcessor crops tiles to exactly (patch_size * n_patches) so every
         # pixel is valid. Skip the pixel_attention_mask unfold+sum and pass None so the
         # vision encoder allocates a full-ones mask internally (recipe ⑩, Huang et al. 2026).
-        # Get sequence from the vision encoder
+        # When DeepStack is enabled, ask the vision encoder for all per-layer hidden states
+        # so we can tap intermediate ViT block outputs (pre-final-LayerNorm) at the configured
+        # ``deepstack_visual_indexes``. The connector's ``Idefics3VisionTransformer.forward`` is
+        # decorated with ``capture_outputs(tie_last_hidden_states=False)``, so ``hidden_states[i]``
+        # is the output of encoder layer ``i`` *before* the post-LayerNorm — exactly the tap point
+        # used in nanoVLM.
+        deepstack_enabled = (
+            getattr(self.config, "use_deepstack", False) and self.connector.deepstack_mergers is not None
+        )
+        if deepstack_enabled:
+            kwargs.setdefault("output_hidden_states", True)
         image_outputs = self.vision_model(
             pixel_values=pixel_values, patch_attention_mask=None, return_dict=True, **kwargs
         )
         image_hidden_states = image_outputs.last_hidden_state
-
-        # Modality projection & resampling
         image_features = self.connector(image_hidden_states)
         image_outputs.pooler_output = image_features
+
+        if deepstack_enabled and image_outputs.hidden_states is not None:
+            # One projected tensor per ViT tap, shape [N_real_tiles, num_image_tokens, lm_dim].
+            ds_indexes = self.config.deepstack_visual_indexes
+            image_outputs.deepstack_features = [
+                self.connector.deepstack_mergers[slot](image_outputs.hidden_states[layer_idx])
+                for slot, layer_idx in enumerate(ds_indexes)
+            ]
+        else:
+            image_outputs.deepstack_features = None
 
         return image_outputs
 
@@ -754,10 +2186,22 @@ class GraniteDoclingHybridModel(GraniteDoclingHybridPreTrainedModel):
             inputs_embeds = self.text_model.get_input_embeddings()(input_ids).to(self.device)
 
         # START VISUAL INPUTS INTEGRATION
+        deepstack_visual_embeds: list[torch.Tensor] | None = None
+        visual_pos_masks: torch.Tensor | None = None
         if pixel_values is not None and image_hidden_states is not None:
             raise ValueError("You cannot specify both pixel_values and image_hidden_states at the same time")
         elif pixel_values is not None:
-            image_hidden_states = self.get_image_features(pixel_values, pixel_attention_mask).pooler_output
+            image_outputs = self.get_image_features(pixel_values, pixel_attention_mask)
+            image_hidden_states = image_outputs.pooler_output
+            # DeepStack: project the intermediate ViT features to LM dim and flatten across
+            # the tile dim. The mergers' output is [N_tiles, num_image_tokens, lm_dim]; we
+            # reshape to [N_tiles * num_image_tokens, lm_dim] so it lines up token-for-token
+            # with ``visual_pos_masks`` (one position per <image> token in the LM sequence).
+            ds_features = getattr(image_outputs, "deepstack_features", None)
+            if ds_features is not None and input_ids is not None:
+                lm_dim = self.config.text_config.hidden_size
+                deepstack_visual_embeds = [feat.reshape(-1, lm_dim) for feat in ds_features]
+                visual_pos_masks = input_ids == self.config.image_token_id
         elif image_hidden_states is not None:
             image_hidden_states = image_hidden_states.to(dtype=self.dtype, device=input_ids.device)
 
@@ -770,6 +2214,17 @@ class GraniteDoclingHybridModel(GraniteDoclingHybridPreTrainedModel):
                 image_hidden_states=image_hidden_states,
             )
 
+        # DeepStack is restricted to prefill — see nanoVLM's ``_build_deepstack_embeds`` /
+        # generate paths and the paper. During autoregressive decoding ``pixel_values`` is
+        # None so we naturally pass None for the deepstack kwargs.
+        deepstack_kwargs = {}
+        if deepstack_visual_embeds is not None:
+            deepstack_kwargs = {
+                "visual_pos_masks": visual_pos_masks,
+                "deepstack_visual_embeds": deepstack_visual_embeds,
+                "deepstack_attn_layers": list(self.config.deepstack_attn_layers),
+            }
+
         outputs = self.text_model(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
@@ -778,6 +2233,7 @@ class GraniteDoclingHybridModel(GraniteDoclingHybridPreTrainedModel):
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
+            **deepstack_kwargs,
             **kwargs,
         )
 

@@ -18,6 +18,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from huggingface_hub.dataclasses import strict
+
 from ...configuration_utils import PreTrainedConfig, PretrainedConfig
 from ...modeling_rope_utils import RopeParameters
 from ...utils import auto_docstring, logging
@@ -28,37 +30,9 @@ logger = logging.get_logger(__name__)
 
 
 @auto_docstring(checkpoint="HuggingFaceM4/GraniteDoclingHybrid-8B-Llama3")
+@strict
 class GraniteDoclingHybridVisionConfig(PreTrainedConfig):
     r"""
-    Args:
-        hidden_size (`int`, *optional*, defaults to 1152):
-            Dimensionality of the encoder layers and the pooler layer.
-        intermediate_size (`int`, *optional*, defaults to 3072):
-            Dimensionality of the feed-forward layer in the transformer encoder.
-        num_hidden_layers (`int`, *optional*, defaults to 12):
-            Number of hidden layers in the transformer encoder.
-        num_attention_heads (`int`, *optional*, defaults to 16):
-            Number of attention heads for each attention layer in the transformer encoder.
-        num_channels (`int`, *optional*, defaults to 3):
-            Number of input image channels.
-        image_size (`int`, *optional*, defaults to 224):
-            The size (resolution) of each image tile.
-        patch_size (`int`, *optional*, defaults to 32):
-            The size (resolution) of each patch.
-        hidden_act (`str`, *optional*, defaults to `"gelu_pytorch_tanh"`):
-            The non-linear activation function in the encoder and pooler.
-        layer_norm_eps (`float`, *optional*, defaults to 1e-6):
-            The epsilon used by the layer normalization layers.
-        attention_dropout (`float`, *optional*, defaults to 0.0):
-            The dropout ratio for the attention probabilities.
-        initializer_range (`float`, *optional*, defaults to 0.02):
-            The standard deviation of the truncated_normal_initializer for initializing weight matrices.
-        image_mean (`list[float]`, *optional*, defaults to `[0.48145466, 0.4578275, 0.40821073]`):
-            Per-channel mean used to normalize pixel values. When the processor outputs uint8 images
-            (recipe ⑧), the model normalizes on GPU using these values.
-        image_std (`list[float]`, *optional*, defaults to `[0.26862954, 0.26130258, 0.27577711]`):
-            Per-channel standard deviation used to normalize pixel values. See `image_mean`.
-
     Example:
 
     ```python
@@ -78,183 +52,124 @@ class GraniteDoclingHybridVisionConfig(PreTrainedConfig):
     model_type = "granite_docling_hybrid_vision"
     base_config_key = "vision_config"
 
-    def __init__(
-        self,
-        hidden_size=1152,
-        intermediate_size=3072,
-        num_hidden_layers=12,
-        num_attention_heads=16,
-        num_channels=3,
-        image_size=224,
-        patch_size=32,
-        hidden_act="gelu_pytorch_tanh",
-        layer_norm_eps=1e-6,
-        attention_dropout=0.0,
-        initializer_range=0.02,
-        image_mean=(0.48145466, 0.4578275, 0.40821073),
-        image_std=(0.26862954, 0.26130258, 0.27577711),
-        **kwargs,
-    ):
-        super().__init__(**kwargs)
-
-        self.hidden_size = hidden_size
-        self.intermediate_size = intermediate_size
-        self.num_hidden_layers = num_hidden_layers
-        self.num_attention_heads = num_attention_heads
-        self.num_channels = num_channels
-        self.patch_size = patch_size
-        self.image_size = image_size
-        self.attention_dropout = attention_dropout
-        self.layer_norm_eps = layer_norm_eps
-        self.hidden_act = hidden_act
-        self.initializer_range = initializer_range
-        self.image_mean = list(image_mean)
-        self.image_std = list(image_std)
+    hidden_size: int = 1152
+    intermediate_size: int = 3072
+    num_hidden_layers: int = 12
+    num_attention_heads: int = 16
+    num_channels: int = 3
+    image_size: int | list[int] | tuple[int, int] = 224
+    patch_size: int | list[int] | tuple[int, int] = 32
+    hidden_act: str = "gelu_pytorch_tanh"
+    layer_norm_eps: float = 1e-6
+    attention_dropout: float | int = 0.0
+    initializer_range: float = 0.02
 
 
 @auto_docstring(checkpoint="ibm-granite/granite-speech-3.2-8b")
-class GraniteDoclingHybridGraniteMoeHybridConfig(PreTrainedConfig):
+@strict
+class GraniteDoclingHybridTextConfig(PreTrainedConfig):
     r"""
-    embedding_multiplier (`float`, *optional*, defaults to 1.0): embedding multiplier.
-    logits_scaling (`float`, *optional*, defaults to 1.0): divisor for output logits.
-    residual_multiplier (`float`, *optional*, defaults to 1.0): residual multiplier.
-    attention_multiplier (`float`, *optional*, defaults to 1.0): attention multiplier.
-    position_embedding_type (`str`, *optional*): Positional embedding type to be used; defaults to None. Allowed options: `[None, "rope"]`
-    shared_intermediate_size (`int`, *optional*, defaults to 1024): intermediate size for shared experts.
+    embedding_multiplier (`float`, *optional*, defaults to 1.0):
+        embedding multiplier.
+    logits_scaling (`float`, *optional*, defaults to 1.0):
+        divisor for output logits.
+    residual_multiplier (`float`, *optional*, defaults to 1.0):
+        residual multiplier.
+    attention_multiplier (`float`, *optional*, defaults to 1.0):
+        attention multiplier.
+    shared_intermediate_size (`int`, *optional*, defaults to 1024):
+        intermediate size for shared experts.
+    position_embedding_type (`str`, *optional*):
+        Positional embedding type to be used; defaults to None. Allowed options: `[None, "rope"]`
 
     Example:
 
     ```python
-    >>> from transformers import GraniteDoclingHybridGraniteMoeHybridModel, GraniteDoclingHybridGraniteMoeHybridConfig
+    >>> from transformers import GraniteDoclingHybridTextModel, GraniteDoclingHybridTextConfig
 
-    >>> # Initializing a GraniteDoclingHybridGraniteMoeHybrid config
-    >>> configuration = GraniteDoclingHybridGraniteMoeHybridConfig()
-
+    >>> # Initializing a GraniteDoclingHybridText config
+    >>> configuration = GraniteDoclingHybridTextConfig()
 
     >>> # Accessing the model configuration
     >>> configuration = model.config
     ```"""
 
-    model_type = "granite_docling_hybrid_granite_moe_hybrid"
+    model_type = "granite_docling_hybrid_text"
     attribute_map = {
         "layers_block_type": "layer_types",
     }
     keys_to_ignore_at_inference = ["past_key_values"]
 
-    def __init__(
-        self,
-        vocab_size: int | None = 32000,
-        hidden_size: int | None = 4096,
-        intermediate_size: int | None = 11008,
-        num_hidden_layers: int | None = 32,
-        num_attention_heads: int | None = 32,
-        num_key_value_heads: int | None = None,
-        hidden_act: str | None = "silu",
-        max_position_embeddings: int | None = 2048,
-        initializer_range: float | None = 0.02,
-        rms_norm_eps: int | None = 1e-6,
-        use_cache: bool | None = True,
-        pad_token_id: int | None = None,
-        bos_token_id: int | None = 1,
-        eos_token_id: int | None = 2,
-        tie_word_embeddings: bool | None = False,
-        rope_parameters: RopeParameters | dict[str, RopeParameters] | None = None,
-        attention_bias: bool | None = False,
-        attention_dropout: float | None = 0.0,
-        embedding_multiplier: float | None = 1.0,
-        logits_scaling: float | None = 1.0,
-        residual_multiplier: float | None = 1.0,
-        attention_multiplier: float | None = 1.0,
-        num_local_experts: int | None = 8,
-        num_experts_per_tok: int | None = 2,
-        output_router_logits: bool | None = False,
-        router_aux_loss_coef: float | None = 0.001,
-        shared_intermediate_size: int | None = 1024,
-        position_embedding_type: str | None = None,
-        layer_types: list[str] | None = None,
-        mamba_n_heads: int | None = 128,
-        mamba_n_groups: int | None = 1,
-        mamba_d_state: int | None = 256,
-        mamba_d_head: str | None = "auto",
-        mamba_d_conv: int | None = 4,
-        mamba_expand: int | None = 2,
-        mamba_chunk_size: int | None = 256,
-        mamba_conv_bias: bool | None = True,
-        mamba_proj_bias: bool | None = False,
-        time_step_min: float | None = 0.001,
-        time_step_max: float | None = 0.1,
-        time_step_limit: tuple[float, float] | None = (0.0, float("inf")),
-        **kwargs,
-    ):
-        self.vocab_size = vocab_size
-        self.max_position_embeddings = max_position_embeddings
-        self.hidden_size = hidden_size
-        self.intermediate_size = intermediate_size
-        self.num_hidden_layers = num_hidden_layers
-        self.num_attention_heads = num_attention_heads
+    vocab_size: int = 32000
+    hidden_size: int = 4096
+    intermediate_size: int = 11008
+    num_hidden_layers: int = 32
+    num_attention_heads: int = 32
+    num_key_value_heads: int | None = None
+    hidden_act: str = "silu"
+    max_position_embeddings: int = 2048
+    initializer_range: float = 0.02
+    rms_norm_eps: float = 1e-6
+    use_cache: bool = True
+    pad_token_id: int | None = None
+    bos_token_id: int | None = 1
+    eos_token_id: int | list[int] | None = 2
+    tie_word_embeddings: bool = False
+    rope_parameters: RopeParameters | dict | None = None
+    attention_bias: bool = False
+    attention_dropout: float | int | None = 0.0
+    embedding_multiplier: int | float | None = 1.0
+    logits_scaling: int | float | None = 1.0
+    residual_multiplier: int | float | None = 1.0
+    attention_multiplier: int | float | None = 1.0
+    num_local_experts: int | None = 8
+    num_experts_per_tok: int | None = 2
+    output_router_logits: bool | None = False
+    router_aux_loss_coef: float | None = 0.001
+    shared_intermediate_size: int = 1024
+    position_embedding_type: str | None = None
+    layer_types: list[str] | None = None
+    mamba_n_heads: int | None = 128
+    mamba_n_groups: int | None = 1
+    mamba_d_state: int | None = 256
+    mamba_d_head: int | str | None = "auto"
+    mamba_d_conv: int | None = 4
+    mamba_expand: int | None = 2
+    mamba_chunk_size: int | None = 256
+    mamba_conv_bias: bool | None = True
+    mamba_proj_bias: bool | None = False
+    time_step_min: float | None = 0.001
+    time_step_max: float | None = 0.1
+    time_step_limit: list[float, float] | tuple[float, float] | None = (0.0, float("inf"))
 
-        # for backward compatibility
-        if num_key_value_heads is None:
-            num_key_value_heads = num_attention_heads
+    def __post_init__(self, **kwargs):
+        if self.num_key_value_heads is None:
+            self.num_key_value_heads = self.num_attention_heads
 
-        self.num_key_value_heads = num_key_value_heads
-        self.hidden_act = hidden_act
-        self.initializer_range = initializer_range
-        self.rms_norm_eps = rms_norm_eps
-        self.use_cache = use_cache
-        self.attention_bias = attention_bias
-        self.embedding_multiplier = embedding_multiplier
-        self.logits_scaling = logits_scaling
-        self.residual_multiplier = residual_multiplier
-        self.attention_multiplier = attention_multiplier
-        self.attention_dropout = attention_dropout
-        self.num_local_experts = num_local_experts
-        self.num_experts_per_tok = num_experts_per_tok
-        self.output_router_logits = output_router_logits
-        self.router_aux_loss_coef = router_aux_loss_coef
-        self.shared_intermediate_size = shared_intermediate_size
-        self.position_embedding_type = position_embedding_type
-        self.rope_parameters = rope_parameters
+        mamba_intermediate = self.mamba_expand * self.hidden_size
+        if self.mamba_d_head == "auto":
+            self.mamba_d_head = mamba_intermediate // self.mamba_n_heads
 
-        mamba_intermediate = mamba_expand * hidden_size
+        self.time_step_limit = tuple(self.time_step_limit) if self.time_step_limit is not None else None
+        if self.layer_types is None:
+            self.layer_types = ["mamba"] * self.num_hidden_layers
 
-        if layer_types is not None and any(layer_type not in ["mamba", "attention"] for layer_type in layer_types):
-            raise ValueError("layer_types must be a list strings in  [`mamba` `attention`]")
+        super().__post_init__(**kwargs)
 
-        if mamba_intermediate % mamba_n_heads != 0:
+    def validate_architecture(self):
+        """Part of `@strict`-powered validation. Validates the architecture of the config."""
+
+        mamba_intermediate = self.mamba_expand * self.hidden_size
+        if mamba_intermediate % self.mamba_n_heads != 0:
             raise ValueError("mamba_n_heads must divide mamba_expand * hidden_size")
 
-        # for the mamba_v2, must satisfy the following
-        if mamba_d_head == "auto":
-            mamba_d_head = mamba_intermediate // mamba_n_heads
-
-        if mamba_d_head * mamba_n_heads != mamba_intermediate:
+        if self.mamba_d_head * self.mamba_n_heads != mamba_intermediate:
             raise ValueError("The dimensions for the Mamba head state do not match the model intermediate_size")
-
-        self.mamba_n_heads = mamba_n_heads
-        self.mamba_d_head = mamba_d_head
-        self.mamba_n_groups = mamba_n_groups
-        self.mamba_d_state = mamba_d_state
-        self.mamba_d_conv = mamba_d_conv
-        self.mamba_chunk_size = mamba_chunk_size
-        self.mamba_conv_bias = mamba_conv_bias
-        self.mamba_proj_bias = mamba_proj_bias
-        self.time_step_min = time_step_min
-        self.time_step_max = time_step_max
-        self.time_step_limit = tuple(time_step_limit) if time_step_limit is not None else None
-        self.mamba_expand = mamba_expand
-        self.layer_types = layer_types
-
-        self.tie_word_embeddings = tie_word_embeddings
-        self.pad_token_id = pad_token_id
-        self.bos_token_id = bos_token_id
-        self.eos_token_id = eos_token_id
-        super().__init__(**kwargs)
 
     # overwrite the function to use in `HybridMambaAttentionDynamicCache`
     @property
     def layers_block_type(self):
-        return self.layer_types if self.layer_types else ["mamba"] * self.num_hidden_layers
+        return self.layer_types
 
 
 class GraniteDoclingHybridConfig(PretrainedConfig):
@@ -278,6 +193,22 @@ class GraniteDoclingHybridConfig(PretrainedConfig):
             Custom text config or dict for the text model
         scale_factor (`int`, *optional*, defaults to 2):
             The scale factor for the image encoder.
+        mp_pooling_mode (`str`, *optional*, defaults to `"pixel_shuffle"`):
+            Modality-projector variant. Supported: `"pixel_shuffle"`, `"pixel_shuffle_mlp"`,
+            `"pixel_shuffle_mlp_v2"`. The two MLP variants add a post-projection GELU + Linear
+            channel mix in LM space; `v2` additionally inserts pre-shuffle / mid / post LayerNorms
+            and a within-tile 2D sincos positional embedding (matching MiniCPM-style resamplers).
+            The structure mirrors nanoVLM's `mp_pooling_mode`.
+        use_deepstack (`bool`, *optional*, defaults to `False`):
+            Whether to enable Qwen3-VL-style DeepStack: intermediate ViT block outputs are projected
+            through dedicated mergers and added (residually) to the LM hidden states at image-token
+            positions after specific decoder layers. See https://arxiv.org/abs/2406.04334.
+        deepstack_visual_indexes (`list[int]`, *optional*, defaults to `[3, 6, 9]`):
+            Indices of vision encoder blocks whose outputs (pre-final-LayerNorm) feed DeepStack.
+            Slot `i` of this list is paired with slot `i` of `deepstack_attn_layers`.
+        deepstack_attn_layers (`list[int]`, *optional*, defaults to `[10, 13, 17]`):
+            Indices of language model decoder layers that receive the residual visual injection
+            from the corresponding ViT tap. Same length as `deepstack_visual_indexes`.
 
     Example:
     ```python
@@ -300,6 +231,10 @@ class GraniteDoclingHybridConfig(PretrainedConfig):
         vision_config=None,
         text_config=None,
         scale_factor=2,
+        mp_pooling_mode="pixel_shuffle",
+        use_deepstack=False,
+        deepstack_visual_indexes=None,
+        deepstack_attn_layers=None,
         **kwargs,
     ):
         self.image_token_id = image_token_id
@@ -322,6 +257,24 @@ class GraniteDoclingHybridConfig(PretrainedConfig):
 
         self.text_config = text_config
         self.scale_factor = scale_factor
+
+        if mp_pooling_mode not in ("pixel_shuffle", "pixel_shuffle_mlp", "pixel_shuffle_mlp_v2"):
+            raise ValueError(
+                f"Unknown mp_pooling_mode={mp_pooling_mode!r}. Supported: "
+                "'pixel_shuffle', 'pixel_shuffle_mlp', 'pixel_shuffle_mlp_v2'."
+            )
+        self.mp_pooling_mode = mp_pooling_mode
+
+        self.use_deepstack = use_deepstack
+        self.deepstack_visual_indexes = (
+            list(deepstack_visual_indexes) if deepstack_visual_indexes is not None else [3, 6, 9]
+        )
+        self.deepstack_attn_layers = list(deepstack_attn_layers) if deepstack_attn_layers is not None else [10, 13, 17]
+        if len(self.deepstack_visual_indexes) != len(self.deepstack_attn_layers):
+            raise ValueError(
+                "deepstack_visual_indexes and deepstack_attn_layers must have the same length "
+                f"(got {len(self.deepstack_visual_indexes)} vs {len(self.deepstack_attn_layers)})."
+            )
 
         super().__init__(**kwargs, tie_word_embeddings=tie_word_embeddings)
 

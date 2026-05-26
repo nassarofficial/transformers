@@ -54,6 +54,80 @@ def is_url(val) -> bool:
     return isinstance(val, str) and val.startswith("http")
 
 
+@lru_cache(maxsize=100)
+def get_optimal_tiled_canvas(
+    original_image_size: tuple[int, int],
+    target_tile_size: tuple[int, int],
+    min_image_tiles: int,
+    max_image_tiles: int,
+) -> tuple[int, int]:
+    """
+    Given a minimum and maximum number of tiles, find the canvas with the closest aspect ratio to the
+    original image aspect ratio.
+    In case of tie-breaking condition when two canvases have the same aspect ratio difference, we favor the canvas with
+    more tiles, until the area covered by the tiles is more than twice the target area, in order to avoid unnecessarily
+    excessive tiling.
+    """
+    possible_tile_arrangements = get_all_supported_aspect_ratios(min_image_tiles, max_image_tiles)
+
+    original_height, original_width = original_image_size
+    target_tile_height, target_tile_width = target_tile_size
+    aspect_ratio = original_width / original_height
+    area = original_width * original_height
+
+    # find the grid with the best aspect ratio
+    best_ratio_diff = float("inf")
+    best_grid = (1, 1)
+    for grid in possible_tile_arrangements:
+        grid_aspect_ratio = grid[0] / grid[1]
+        ratio_diff = abs(aspect_ratio - grid_aspect_ratio)
+        if ratio_diff < best_ratio_diff:
+            best_ratio_diff = ratio_diff
+            best_grid = grid
+        elif ratio_diff == best_ratio_diff:
+            # if the aspect ratio difference is the same, we favor the grid with more patches
+            # until the area covered by the patches is more than twice the original image area
+            if area > 0.5 * target_tile_height * target_tile_width * grid[0] * grid[1]:
+                best_grid = grid
+
+    return best_grid
+
+
+@lru_cache(maxsize=10)
+def get_all_supported_aspect_ratios(min_image_tiles: int, max_image_tiles: int) -> list[tuple[int, int]]:
+    """
+    Computes all allowed aspect ratios for a given minimum and maximum number of input tiles.
+
+    This function calculates all possible arrangements of tiles that can be formed
+    within the constraint of the minimum and maximum number of tiles. Each arrangement is
+    represented by its aspect ratio (width/height) and the corresponding tile configuration.
+
+    Args:
+        min_image_tiles (`int`):
+            The minimum number of tiles allowed.
+        max_image_tiles (`int`):
+            The maximum number of tiles allowed.
+
+    Returns:
+        `list[tuple[int, int]]`: A list of tuples, each tuple representing a valid (width, height)
+        configuration in terms of number of tiles.
+
+    Example:
+        >>> get_all_supported_aspect_ratios(1, 4)
+        [(1, 1), (1, 2), (2, 1), (1, 3), (3, 1), (1, 4), (2, 2), (4, 1)]
+
+    """
+    aspect_ratios = []
+    for width in range(1, max_image_tiles + 1):
+        for height in range(1, max_image_tiles + 1):
+            if width * height <= max_image_tiles and width * height >= min_image_tiles:
+                aspect_ratios.append((width, height))
+
+    aspect_ratios = sorted(aspect_ratios, key=lambda x: x[0] * x[1])
+
+    return aspect_ratios
+
+
 def _prompt_split_image(image_seq_len, image_rows, image_cols, fake_token_around_image, image_token, global_img_token):
     """Prompt with expanded image tokens for when the image is split into patches.
 
@@ -80,7 +154,7 @@ def _prompt_split_image(image_seq_len, image_rows, image_cols, fake_token_around
 
 
 def _prompt_single_image(image_seq_len, fake_token_around_image, image_token, global_img_token):
-    """Prompt with expanded image tokens for a single image."""
+    """Prompt with expanded image tokens for a single image (no tiles)."""
     return (
         f"{fake_token_around_image}"
         + f"{global_img_token}"
@@ -137,86 +211,9 @@ def get_compact_image_prompt_string(image_rows, image_cols, fake_token_around_im
     return _compact_prompt_split_image(image_rows, image_cols, fake_token_around_image, global_img_token)
 
 
-@lru_cache(maxsize=100)
-def get_optimal_tiled_canvas(
-    original_image_size: tuple[int, int],
-    target_tile_size: tuple[int, int],
-    min_image_tiles: int,
-    max_image_tiles: int,
-) -> tuple[int, int]:
-    """
-    Given a minimum and maximum number of tiles, find the canvas with the closest aspect ratio to the
-    original image aspect ratio.
-    In case of tie-breaking condition when two canvases have the same aspect ratio difference, we favor the canvas with
-    more tiles, until the area covered by the tiles is more than twice the target area, in order to avoid unnecessarily
-    excessive tiling.
-    """
-    possible_tile_arrangements = get_all_supported_aspect_ratios(min_image_tiles, max_image_tiles)
-
-    original_height, original_width = original_image_size
-    target_tile_height, target_tile_width = target_tile_size
-    aspect_ratio = original_width / original_height
-    area = original_width * original_height
-
-    # find the grid with the best aspect ratio
-    best_ratio_diff = float("inf")
-    best_grid = (1, 1)
-    for grid in possible_tile_arrangements:
-        grid_aspect_ratio = grid[0] / grid[1]
-        ratio_diff = abs(aspect_ratio - grid_aspect_ratio)
-        if ratio_diff < best_ratio_diff:
-            best_ratio_diff = ratio_diff
-            best_grid = grid
-        elif ratio_diff == best_ratio_diff:
-            # if the aspect ratio difference is the same, we favor the grid with more patches
-            # until the area covered by the patches is more than twice the original image area
-            if area > 0.5 * target_tile_height * target_tile_width * grid[0] * grid[1]:
-                best_grid = grid
-
-    return best_grid
-
-
-# Similar to image_processing_mllama.get_all_supported_aspect_ratios
-@lru_cache(maxsize=10)
-def get_all_supported_aspect_ratios(min_image_tiles: int, max_image_tiles: int) -> list[tuple[int, int]]:
-    """
-    Computes all allowed aspect ratios for a given minimum and maximum number of input tiles.
-
-    This function calculates all possible arrangements of tiles that can be formed
-    within the constraint of the minimum and maximum number of tiles. Each arrangement is
-    represented by its aspect ratio (width/height) and the corresponding tile configuration.
-
-    Args:
-        min_image_tiles (`int`):
-            The minimum number of tiles allowed.
-        max_image_tiles (`int`):
-            The maximum number of tiles allowed.
-
-    Returns:
-        `list[tuple[int, int]]`: A list of tuples, each tuple representing a valid (width, height)
-        configuration in terms of number of tiles.
-
-    Example:
-        >>> get_all_supported_aspect_ratios(1, 4)
-        [(1, 1), (1, 2), (2, 1), (1, 3), (3, 1), (1, 4), (2, 2), (4, 1)]
-
-    """
-    aspect_ratios = []
-    for width in range(1, max_image_tiles + 1):
-        for height in range(1, max_image_tiles + 1):
-            if width * height <= max_image_tiles and width * height >= min_image_tiles:
-                aspect_ratios.append((width, height))
-
-    aspect_ratios = sorted(aspect_ratios, key=lambda x: x[0] * x[1])
-
-    return aspect_ratios
-
-
 @auto_docstring
 class GraniteDoclingHybridProcessor(ProcessorMixin):
-    def __init__(
-        self, image_processor, tokenizer=None, image_seq_len: int = 169, chat_template: str | None = None, **kwargs
-    ):
+    def __init__(self, image_processor, tokenizer=None, image_seq_len: int = 169, chat_template=None, **kwargs):
         r"""
         image_seq_len (`int`, *optional*, defaults to 169):
             The length of the image sequence i.e. the number of <image> tokens per image in the input.
@@ -232,14 +229,11 @@ class GraniteDoclingHybridProcessor(ProcessorMixin):
         self.fake_image_token_id = tokenizer.convert_tokens_to_ids(self.fake_image_token)
         self.global_image_token_id = tokenizer.convert_tokens_to_ids(self.global_image_tag)
         # Cover up to 16×16 grids (max_patches=256); stored as a set for O(1) lookup
-        # during post-tokenization image-token expansion.
-        _unk = tokenizer.unk_token_id
-        self.row_col_ids = {
-            tid for tid in (
-                tokenizer.convert_tokens_to_ids(f"<row_{i + 1}_col_{j + 1}>")
-                for i in range(16) for j in range(16)
-            ) if tid != _unk
-        }
+        # during post-tokenization image-token expansion. Filters out the tokenizer's UNK id
+        # so unknown row/col tokens don't collapse to a single entry. `unk_token_id` is
+        # inlined into the comprehension because the modular converter drops bare local
+        # variables when it merges the parent class's __init__ body.
+        self.row_col_ids = self._collect_row_col_ids(tokenizer)
 
         # This regex matches one or more occurrences of <global-img> tags (optionally surrounded by newline characters)
         # or <row_x_col_y> tags (where x and y are digits, also optionally surrounded by newline characters).
@@ -268,42 +262,6 @@ class GraniteDoclingHybridProcessor(ProcessorMixin):
                     images.append(load_image(elem))
             prompt_images.append(images)
         return prompt_images
-
-    def _expand_image_tokens_in_ids(
-        self,
-        input_ids: list[list[int]],
-        attention_mask: list[list[int]],
-    ) -> tuple[list[list[int]], list[list[int]]]:
-        """Insert image_seq_len <image> token IDs after each row/col and global-img marker.
-
-        This is the counterpart to compact tokenization (recipe ⑦, Huang et al. 2026):
-        instead of tokenizing a prompt that contains hundreds of repeated '<image>' strings,
-        we tokenize a compact version and expand here with a fast Python list splice.
-
-        The resulting input_ids are identical to what full-prompt tokenization produces,
-        so the model forward pass is unaffected.
-        """
-        image_token_id = self.image_token_id
-        row_col_ids = self.row_col_ids  # set[int]
-        global_id = self.global_image_token_id
-        image_seq_len = self.image_seq_len
-        image_fill = [image_token_id] * image_seq_len
-        mask_fill = [1] * image_seq_len
-
-        expanded_ids = []
-        expanded_mask = []
-        for ids_row, mask_row in zip(input_ids, attention_mask):
-            new_ids: list[int] = []
-            new_mask: list[int] = []
-            for tok_id, m in zip(ids_row, mask_row):
-                new_ids.append(tok_id)
-                new_mask.append(m)
-                if tok_id in row_col_ids or tok_id == global_id:
-                    new_ids.extend(image_fill)
-                    new_mask.extend(mask_fill)
-            expanded_ids.append(new_ids)
-            expanded_mask.append(new_mask)
-        return expanded_ids, expanded_mask
 
     @auto_docstring
     def __call__(
@@ -403,18 +361,65 @@ class GraniteDoclingHybridProcessor(ProcessorMixin):
                     image_cols.append(sample_image_cols)
 
                 # Post-process inputs for GotOcr2ImageProcessor
-                inputs.pop("num_patches", None)  # Not needed downstream
+                num_patches_arr = inputs.pop("num_patches", None)
                 pixel_values = inputs.get("pixel_values")
                 if pixel_values is not None and len(pixel_values.shape) == 4:
-                    # Make 5D to match Idefics3 expected format: (batch, num_images, num_channels, height, width)
-                    inputs["pixel_values"] = pixel_values.unsqueeze(0)
+                    # TODO: change
+                    # Make 5D to match Idefics3 expected format: (batch, num_images, C, H, W)
+                    # pixel_values is (total_sub_images, C, H, W) — a flat concat of all patches
+                    # from all images. We need to group them per sample and pad to the max
+                    # patch count so the tensor is rectangular.  The Idefics3 model's
+                    # get_image_features will filter out zero-padded (all-zero) sub-images.
+                    batch_size = len(images)
+
+                    # Compute number of sub-images per sample (sum patches of each image in the sample)
+                    if num_patches_arr is not None:
+                        img_offset = 0
+                        patches_per_sample = []
+                        for sample_imgs in images:
+                            n_imgs = len(sample_imgs)
+                            patches_per_sample.append(int(sum(num_patches_arr[img_offset : img_offset + n_imgs])))
+                            img_offset += n_imgs
+                    else:
+                        # Fallback: assume equal distribution
+                        total = pixel_values.shape[0]
+                        patches_per_sample = [total // batch_size] * batch_size
+
+                    max_patches = max(patches_per_sample)
+                    if all(p == max_patches for p in patches_per_sample):
+                        # All samples have the same number of sub-images — simple reshape
+                        inputs["pixel_values"] = pixel_values.reshape(batch_size, max_patches, *pixel_values.shape[1:])
+                    else:
+                        # Variable sub-image counts — pad shorter samples with zeros
+                        # (the model filters out all-zero sub-images in get_image_features)
+                        padded = torch.zeros(
+                            batch_size,
+                            max_patches,
+                            *pixel_values.shape[1:],
+                            dtype=pixel_values.dtype,
+                            device=pixel_values.device,
+                        )
+                        pv_offset = 0
+                        for i, count in enumerate(patches_per_sample):
+                            padded[i, :count] = pixel_values[pv_offset : pv_offset + count]
+                            pv_offset += count
+                        inputs["pixel_values"] = padded
+
+                    # TODO: change
+                    # Explicit mask so get_image_features can distinguish real
+                    # sub-images from zero-padding without relying on pixel values
+                    # (a genuinely all-black tile would otherwise be dropped).
+                    pam = torch.zeros(batch_size, max_patches, dtype=torch.bool)
+                    for i, count in enumerate(patches_per_sample):
+                        pam[i, :count] = True
+                    inputs["pixel_attention_mask"] = pam
 
                 fake_image_token = self.fake_image_token
                 image_token = self.image_token
                 global_img_token = self.global_image_tag
 
-                prompt_strings = []         # full expanded — only used for _check_special_mm_tokens
-                compact_prompt_strings = [] # compact — used for tokenization (no repeated <image> tokens)
+                prompt_strings = []  # full expanded — only used for _check_special_mm_tokens
+                compact_prompt_strings = []  # compact — used for tokenization (no repeated <image> tokens)
                 batch_image_seq_lengths = []
                 for sample, sample_rows, sample_cols in zip(text, image_rows, image_cols):
                     image_prompt_strings = []
@@ -463,12 +468,17 @@ class GraniteDoclingHybridProcessor(ProcessorMixin):
                 # Expand: splice image_seq_len <image> token IDs after each row/col and
                 # global-img marker. Result is identical to full-prompt tokenization.
                 input_ids = text_inputs["input_ids"]
-                attention_mask = text_inputs.get(
-                    "attention_mask", [[1] * len(ids) for ids in input_ids]
-                )
-                expanded_ids, expanded_mask = self._expand_image_tokens_in_ids(
-                    input_ids, attention_mask
-                )
+                attention_mask = text_inputs.get("attention_mask", [[1] * len(ids) for ids in input_ids])
+                expanded_ids, expanded_mask = self._expand_image_tokens_in_ids(input_ids, attention_mask)
+                # TODO: change
+                # Pad expanded sequences to uniform length so they can be stacked
+                # into a tensor. Different images produce different tile counts,
+                # so post-expansion lengths vary across the batch.
+                max_len = max(len(ids) for ids in expanded_ids)
+                pad_id = self.tokenizer.pad_token_id
+                expanded_ids = [ids + [pad_id] * (max_len - len(ids)) for ids in expanded_ids]
+                expanded_mask = [m + [0] * (max_len - len(m)) for m in expanded_mask]
+
                 text_inputs["input_ids"] = expanded_ids
                 if "attention_mask" in text_inputs:
                     text_inputs["attention_mask"] = expanded_mask
@@ -502,13 +512,30 @@ class GraniteDoclingHybridProcessor(ProcessorMixin):
 
         return BatchFeature(data=inputs, tensor_type=return_tensors)
 
+    def create_mm_token_type_ids(self, input_ids: list, batch_image_seq_lengths: list[int]) -> list[list[int]]:
+        # We have to iterate for each list separately because inputs
+        # might be non-padded lists and we can't cast numpy on that!
+        # Then cast numpy as each input for faster indexing
+        mm_token_type_ids = []
+        for i, seq_lengths in enumerate(batch_image_seq_lengths):
+            array_ids = np.array(input_ids[i])
+            mm_token_types = np.zeros_like(array_ids)
+            image_start_positions = np.where(array_ids == self.fake_image_token_id)[0]
+            j = 0
+            for seq_len in seq_lengths:
+                if j >= len(image_start_positions):
+                    break
+                start = image_start_positions[j]
+                end = start + seq_len
+                mm_token_types[start:end] = 1
+                j = np.searchsorted(image_start_positions, end)
+            mm_token_type_ids.append(mm_token_types.tolist())
+
+        return mm_token_type_ids
+
     def _get_num_multimodal_tokens(self, image_sizes=None, **kwargs):
         """
         Computes the number of placeholder tokens needed for multimodal inputs with the given sizes.
-
-        GotOcr2ImageProcessor.get_number_of_image_patches returns a plain int
-        (unlike Idefics3's 3-tuple), so we derive rows/cols ourselves via
-        get_optimal_tiled_canvas.
 
         Args:
             image_sizes (`list[list[int]]`, *optional*):
@@ -518,50 +545,76 @@ class GraniteDoclingHybridProcessor(ProcessorMixin):
             `MultiModalData`: A `MultiModalData` object holding number of tokens per each of the provided
             input modalities, along with other useful data.
         """
-        from ..got_ocr2.image_processing_got_ocr2 import get_optimal_tiled_canvas
 
         vision_data = {}
         if image_sizes is not None:
             images_kwargs = GraniteDoclingHybridProcessorKwargs._defaults.get("images_kwargs", {})
             images_kwargs.update(kwargs)
 
-            ip = self.image_processor
-            min_patches = images_kwargs.get("min_patches", getattr(ip, "min_patches", 1))
-            max_patches = images_kwargs.get("max_patches", getattr(ip, "max_patches", 1))
-            patch_size = images_kwargs.get("patch_size", ip.size)
-            crop_to_patches = images_kwargs.get("crop_to_patches", getattr(ip, "crop_to_patches", False))
-
-            if isinstance(patch_size, dict):
-                patch_h, patch_w = patch_size["height"], patch_size["width"]
-            else:
-                patch_h, patch_w = patch_size.height, patch_size.width
+            num_image_row_cols = [
+                self.image_processor.get_number_of_image_patches(*image_size, images_kwargs)
+                for image_size in image_sizes
+            ]
 
             base_image_length = self.image_seq_len + 3
             col_length = self.image_seq_len + 2
             num_image_tokens = []
             num_image_patches = []
 
-            for height, width in image_sizes:
-                num_rows = num_cols = 0
-                n_patches = 1
-                if crop_to_patches and max_patches > 1:
-                    num_cols, num_rows = get_optimal_tiled_canvas(
-                        (height, width), (patch_h, patch_w), min_patches, max_patches
-                    )
-                    if num_cols * num_rows > 1:
-                        n_patches += num_cols * num_rows
-
+            for num_patches, num_rows, num_cols in num_image_row_cols:
                 row_length = col_length * num_cols + 1
                 num_image_tokens.append(base_image_length + (row_length * num_rows))
-                num_image_patches.append(n_patches)
+                num_image_patches.append(num_patches)
 
             vision_data.update({"num_image_tokens": num_image_tokens, "num_image_patches": num_image_patches})
 
         return MultiModalData(**vision_data)
 
+    @staticmethod
+    def _collect_row_col_ids(tokenizer) -> set[int]:
+        if tokenizer is None:
+            return set()
+        unk_id = tokenizer.unk_token_id
+        return {
+            tid
+            for tid in (
+                tokenizer.convert_tokens_to_ids(f"<row_{i + 1}_col_{j + 1}>") for i in range(16) for j in range(16)
+            )
+            if tid != unk_id
+        }
 
-# Needed so `define_import_structure` registers these names on the lazy
-# `transformers.models.granite_docling_hybrid` module; without it,
-# `processor_class_from_name("GraniteDoclingHybridProcessor")` returns None and
-# `AutoProcessor` falls back to `AutoTokenizer`.
-__all__ = ["GraniteDoclingHybridProcessor", "GraniteDoclingHybridProcessorKwargs"]
+    def _expand_image_tokens_in_ids(
+        self,
+        input_ids: list[list[int]],
+        attention_mask: list[list[int]],
+    ) -> tuple[list[list[int]], list[list[int]]]:
+        """Insert image_seq_len <image> token IDs after each row/col and global-img marker.
+
+        This is the counterpart to compact tokenization (recipe ⑦, Huang et al. 2026):
+        instead of tokenizing a prompt that contains hundreds of repeated '<image>' strings,
+        we tokenize a compact version and expand here with a fast Python list splice.
+
+        The resulting input_ids are identical to what full-prompt tokenization produces,
+        so the model forward pass is unaffected.
+        """
+        image_token_id = self.image_token_id
+        row_col_ids = self.row_col_ids  # set[int]
+        global_id = self.global_image_token_id
+        image_seq_len = self.image_seq_len
+        image_fill = [image_token_id] * image_seq_len
+        mask_fill = [1] * image_seq_len
+
+        expanded_ids = []
+        expanded_mask = []
+        for ids_row, mask_row in zip(input_ids, attention_mask):
+            new_ids: list[int] = []
+            new_mask: list[int] = []
+            for tok_id, m in zip(ids_row, mask_row):
+                new_ids.append(tok_id)
+                new_mask.append(m)
+                if tok_id in row_col_ids or tok_id == global_id:
+                    new_ids.extend(image_fill)
+                    new_mask.extend(mask_fill)
+            expanded_ids.append(new_ids)
+            expanded_mask.append(new_mask)
+        return expanded_ids, expanded_mask

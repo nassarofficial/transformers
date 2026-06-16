@@ -1,4 +1,3 @@
-# coding=utf-8
 # Copyright 2025 the HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,37 +14,33 @@
 
 import math
 from collections.abc import Callable
-from typing import Optional
+from typing import Any
 
 import torch
 import torch.nn as nn
-import torch.utils.checkpoint
+import torch.nn.functional as F
+from huggingface_hub.dataclasses import strict
 from torch import Tensor
 
-from transformers.models.sam2.modeling_sam2 import (
-    eager_attention_forward,
-    window_partition,
-)
-from transformers.utils.generic import OutputRecorder
-
+from ... import initialization as init
 from ...activations import ACT2FN
 from ...configuration_utils import PreTrainedConfig
 from ...modeling_flash_attention_utils import FlashAttentionKwargs
 from ...modeling_utils import ALL_ATTENTION_FUNCTIONS
 from ...processing_utils import Unpack
 from ...pytorch_utils import compile_compatible_method_lru_cache
-from ...utils import (
-    auto_docstring,
-)
+from ...utils import auto_docstring
+from ...utils.output_capturing import OutputRecorder
 from ..auto import CONFIG_MAPPING, AutoConfig
+from ..sam2.modeling_sam2 import eager_attention_forward, window_partition
 from ..sam2_video.configuration_sam2_video import (
-    Sam2VideoConfig,
     Sam2VideoMaskDecoderConfig,
     Sam2VideoPromptEncoderConfig,
 )
 from ..sam2_video.modeling_sam2_video import (
     Sam2VideoAttention,
     Sam2VideoFeedForward,
+    Sam2VideoImageSegmentationOutput,
     Sam2VideoInferenceSession,
     Sam2VideoLayerNorm,
     Sam2VideoMemoryAttention,
@@ -54,6 +49,7 @@ from ..sam2_video.modeling_sam2_video import (
     Sam2VideoModel,
     Sam2VideoPositionEmbeddingSine,
     Sam2VideoPreTrainedModel,
+    Sam2VideoSegmentationOutput,
     Sam2VideoTwoWayAttentionBlock,
     Sam2VideoVisionEncoderOutput,
     Sam2VideoVisionRotaryEmbedding,
@@ -61,125 +57,118 @@ from ..sam2_video.modeling_sam2_video import (
 )
 
 
+@auto_docstring(checkpoint="yonigozlan/EdgeTAM-hf")
+@strict
 class EdgeTamVideoPromptEncoderConfig(Sam2VideoPromptEncoderConfig):
     pass
 
 
+@auto_docstring(checkpoint="yonigozlan/EdgeTAM-hf")
+@strict
 class EdgeTamVideoMaskDecoderConfig(Sam2VideoMaskDecoderConfig):
     pass
 
 
-class EdgeTamVideoConfig(Sam2VideoConfig):
+@auto_docstring(checkpoint="yonigozlan/EdgeTAM-hf")
+@strict
+class EdgeTamVideoConfig(PreTrainedConfig):
     r"""
-    [`EdgeTamVideoConfig`] is the configuration class to store the configuration of a [`EdgeTamVideoModel`]. It is used to instantiate a
-    EDGETAM model according to the specified arguments, defining the memory attention, memory encoder, and image encoder
-    configs. Instantiating a configuration defaults will yield a similar configuration to that of the SAM 2.1 Hiera-tiny
-    [facebook/EdgeTAM](https://huggingface.co/facebook/EdgeTAM) architecture.
-
-    Configuration objects inherit from [`PreTrainedConfig`] and can be used to control the model outputs. Read the
-    documentation from [`PreTrainedConfig`] for more information.
-
-    Args:
-        vision_config (Union[`dict`, `EdgeTamVideoVisionConfig`], *optional*):
-            Dictionary of configuration options used to initialize [`EdgeTamVideoVisionConfig`].
-        prompt_encoder_config (Union[`dict`, `EdgeTamVideoPromptEncoderConfig`], *optional*):
-            Dictionary of configuration options used to initialize [`EdgeTamVideoPromptEncoderConfig`].
-        mask_decoder_config (Union[`dict`, `EdgeTamVideoMaskDecoderConfig`], *optional*):
-            Dictionary of configuration options used to initialize [`EdgeTamMaskDecoderConfig`].
-        initializer_range (`float`, *optional*, defaults to 0.02):
-            Standard deviation for parameter initialization.
-        num_maskmem (`int`, *optional*, defaults to 7):
-            The number of memory slots for the mask memory.
-        image_size (`int`, *optional*, defaults to 1024):
-            The size of the input images.
-        sigmoid_scale_for_mem_enc (`float`, *optional*, defaults to 20.0):
-            Scale factor for the sigmoid function in the memory encoder.
-        sigmoid_bias_for_mem_enc (`float`, *optional*, defaults to -10.0):
-            Bias for the sigmoid function in the memory encoder.
-        enable_occlusion_spatial_embedding (`bool`, *optional*, defaults to `True`):
-            Whether to enable spatial embedding for occlusions.
-        multimask_output_in_sam (`bool`, *optional*, defaults to `True`):
-            Whether to output multiple masks from the SAM head.
-        multimask_min_pt_num (`int`, *optional*, defaults to 0):
-            The minimum number of points to trigger multimask output.
-        multimask_max_pt_num (`int`, *optional*, defaults to 1):
-            The maximum number of points to trigger multimask output.
-        multimask_output_for_tracking (`bool`, *optional*, defaults to `True`):
-            Whether to use multimask output for tracking.
-        max_object_pointers_in_encoder (`int`, *optional*, defaults to 16):
-            The maximum number of object pointers in the encoder.
-        enable_temporal_pos_encoding_for_object_pointers (`bool`, *optional*, defaults to `True`):
-            Whether to enable temporal positional encoding for object pointers.
-        memory_attention_hidden_size (`int`, *optional*, defaults to 256):
-            Dimensionality of the memory attention hidden states.
-        memory_attention_num_layers (`int`, *optional*, defaults to 2):
-            The number of layers in the memory attention module.
-        memory_attention_num_attention_heads (`int`, *optional*, defaults to 1):
-            Number of attention heads for each attention layer in the memory attention.
-        memory_attention_downsample_rate (`int`, *optional*, defaults to 1):
-            The downsample rate for the attention layers.
-        memory_attention_mlp_hidden_size (`int`, *optional*, defaults to 2048):
-            The dimension of the feedforward network in the memory attention module.
-        memory_attention_mlp_hidden_act (`str`, *optional*, defaults to `"relu"`):
-            The non-linear activation function in the feedforward network in the memory attention module.
-        memory_attention_dropout (`float`, *optional*, defaults to 0.1):
-            The dropout rate for the memory attention module.
-        memory_attention_rope_theta (`float`, *optional*, defaults to 10000):
-            The Rope theta parameter.
-        memory_attention_rope_feat_sizes (`Tuple[int, int]`, *optional*, defaults to `[64, 64]`):
-            The feature sizes for the Rope positional encoding.
-        memory_attention_rope_k_sizes (`List[int]`, *optional*, defaults to `[16, 16]`):
-            The key feature sizes for the RoPE positional encoding in memory attention.
-        memory_attention_rope_dropout (`float`, *optional*, defaults to 0.1):
-            The dropout rate for the Rope positional encoding.
-        perceiver_resampler_num_latents (`int`, *optional*, defaults to 256):
-            The number of 1D latent tokens in the perceiver resampler.
-        perceiver_resampler_num_latents_2d (`int`, *optional*, defaults to 256):
-            The number of 2D latent tokens in the perceiver resampler.
-        perceiver_resampler_hidden_size (`int`, *optional*, defaults to 64):
-            The hidden size of the perceiver resampler.
-        perceiver_resampler_mlp_intermediate_size (`int`, *optional*, defaults to 256):
-            The intermediate size of the feedforward network in the perceiver resampler.
-        perceiver_resampler_num_attention_heads (`int`, *optional*, defaults to 1):
-            The number of attention heads in the perceiver resampler.
-        perceiver_resampler_attention_head_dim (`int`, *optional*, defaults to 64):
-            The dimension of each attention head in the perceiver resampler.
-        perceiver_resampler_num_layers (`int`, *optional*, defaults to 2):
-            The number of layers in the perceiver resampler.
-        perceiver_resampler_hidden_dropout (`float`, *optional*, defaults to 0.0):
-            The dropout rate for the hidden layers in the perceiver resampler.
-        perceiver_resampler_attention_dropout (`float`, *optional*, defaults to 0.0):
-            The dropout rate for the attention layers in the perceiver resampler.
-        memory_encoder_hidden_size (`int`, *optional*, defaults to 256):
-            Dimensionality of the memory encoder hidden states.
-        memory_encoder_output_channels (`int`, *optional*, defaults to 64):
-            The number of output channels for the memory encoder.
-        mask_downsampler_embed_dim (`int`, *optional*, defaults to 256):
-            The dimension of the mask downsampler embedding.
-        memory_fuser_intermediate_dim (`int`, *optional*, defaults to 1024):
-            The intermediate dimension of the memory fuser feedforward network.
-        mask_downsampler_kernel_size (`int`, *optional*, defaults to 3):
-            The kernel size for the mask downsampler.
-        mask_downsampler_stride (`int`, *optional*, defaults to 2):
-            The stride for the mask downsampler.
-        mask_downsampler_padding (`int`, *optional*, defaults to 1):
-            The padding for the mask downsampler.
-        mask_downsampler_total_stride (`int`, *optional*, defaults to 16):
-            The total stride for the mask downsampler.
-        mask_downsampler_hidden_act (`str`, *optional*, defaults to `"gelu"`):
-            The non-linear activation function in the mask downsampler.
-        memory_fuser_num_layers (`int`, *optional*, defaults to 2):
-            The number of layers in the memory fuser.
-        memory_fuser_embed_dim (`int`, *optional*, defaults to 256):
-            The dimension of the memory fuser embedding.
-        memory_fuser_kernel_size (`int`, *optional*, defaults to 7):
-            The kernel size for the memory fuser.
-        memory_fuser_padding (`int`, *optional*, defaults to 3):
-            The padding for the memory fuser.
-        memory_fuser_layer_scale_init_value (`float`, *optional*, defaults to 1e-06):
-            The initial value for the layer scale in the memory fuser.
-        memory_fuser_hidden_act (`str`, *optional*, defaults to `"gelu"`):
-            The non-linear activation function in the memory fuser.
+    prompt_encoder_config (Union[`dict`, `EdgeTamVideoPromptEncoderConfig`], *optional*):
+        Dictionary of configuration options used to initialize [`EdgeTamVideoPromptEncoderConfig`].
+    mask_decoder_config (Union[`dict`, `EdgeTamVideoMaskDecoderConfig`], *optional*):
+        Dictionary of configuration options used to initialize [`EdgeTamMaskDecoderConfig`].
+    num_maskmem (`int`, *optional*, defaults to 7):
+        The number of memory slots for the mask memory.
+    sigmoid_scale_for_mem_enc (`float`, *optional*, defaults to 20.0):
+        Scale factor for the sigmoid function in the memory encoder.
+    sigmoid_bias_for_mem_enc (`float`, *optional*, defaults to -10.0):
+        Bias for the sigmoid function in the memory encoder.
+    enable_occlusion_spatial_embedding (`bool`, *optional*, defaults to `True`):
+        Whether to enable spatial embedding for occlusions.
+    multimask_output_in_sam (`bool`, *optional*, defaults to `True`):
+        Whether to output multiple masks from the SAM head.
+    multimask_min_pt_num (`int`, *optional*, defaults to 0):
+        The minimum number of points to trigger multimask output.
+    multimask_max_pt_num (`int`, *optional*, defaults to 1):
+        The maximum number of points to trigger multimask output.
+    multimask_output_for_tracking (`bool`, *optional*, defaults to `True`):
+        Whether to use multimask output for tracking.
+    max_object_pointers_in_encoder (`int`, *optional*, defaults to 16):
+        The maximum number of object pointers in the encoder.
+    max_cond_frame_num (`int`, *optional*, defaults to -1):
+        Maximum number of conditioning frames to use in memory attention. Set to -1 to use all conditioning frames.
+    enable_temporal_pos_encoding_for_object_pointers (`bool`, *optional*, defaults to `True`):
+        Whether to enable temporal positional encoding for object pointers.
+    memory_attention_hidden_size (`int`, *optional*, defaults to 256):
+        Dimensionality of the memory attention hidden states.
+    memory_attention_num_layers (`int`, *optional*, defaults to 2):
+        The number of layers in the memory attention module.
+    memory_attention_num_attention_heads (`int`, *optional*, defaults to 1):
+        Number of attention heads for each attention layer in the memory attention.
+    memory_attention_downsample_rate (`int`, *optional*, defaults to 1):
+        The downsample rate for the attention layers.
+    memory_attention_mlp_hidden_size (`int`, *optional*, defaults to 2048):
+        The dimension of the feedforward network in the memory attention module.
+    memory_attention_mlp_hidden_act (`str`, *optional*, defaults to `"relu"`):
+        The non-linear activation function in the feedforward network in the memory attention module.
+    memory_attention_dropout (`float`, *optional*, defaults to 0.1):
+        The dropout rate for the memory attention module.
+    memory_attention_rope_theta (`float`, *optional*, defaults to 10000):
+        The Rope theta parameter.
+    memory_attention_rope_feat_sizes (`Tuple[int, int]`, *optional*, defaults to `[64, 64]`):
+        The feature sizes for the Rope positional encoding.
+    memory_attention_rope_k_sizes (`List[int]`, *optional*, defaults to `[16, 16]`):
+        The key feature sizes for the RoPE positional encoding in memory attention.
+    memory_attention_rope_dropout (`float`, *optional*, defaults to 0.1):
+        The dropout rate for the Rope positional encoding.
+    perceiver_resampler_num_latents (`int`, *optional*, defaults to 256):
+        The number of 1D latent tokens in the perceiver resampler.
+    perceiver_resampler_num_latents_2d (`int`, *optional*, defaults to 256):
+        The number of 2D latent tokens in the perceiver resampler.
+    perceiver_resampler_hidden_size (`int`, *optional*, defaults to 64):
+        The hidden size of the perceiver resampler.
+    perceiver_resampler_mlp_intermediate_size (`int`, *optional*, defaults to 256):
+        The intermediate size of the feedforward network in the perceiver resampler.
+    perceiver_resampler_num_attention_heads (`int`, *optional*, defaults to 1):
+        The number of attention heads in the perceiver resampler.
+    perceiver_resampler_attention_head_dim (`int`, *optional*, defaults to 64):
+        The dimension of each attention head in the perceiver resampler.
+    perceiver_resampler_num_layers (`int`, *optional*, defaults to 2):
+        The number of layers in the perceiver resampler.
+    perceiver_resampler_hidden_dropout (`float`, *optional*, defaults to 0.0):
+        The dropout rate for the hidden layers in the perceiver resampler.
+    perceiver_resampler_attention_dropout (`float`, *optional*, defaults to 0.0):
+        The dropout rate for the attention layers in the perceiver resampler.
+    memory_encoder_hidden_size (`int`, *optional*, defaults to 256):
+        Dimensionality of the memory encoder hidden states.
+    memory_encoder_output_channels (`int`, *optional*, defaults to 64):
+        The number of output channels for the memory encoder.
+    mask_downsampler_embed_dim (`int`, *optional*, defaults to 256):
+        The dimension of the mask downsampler embedding.
+    memory_fuser_intermediate_dim (`int`, *optional*, defaults to 1024):
+        The intermediate dimension of the memory fuser feedforward network.
+    mask_downsampler_kernel_size (`int`, *optional*, defaults to 3):
+        The kernel size for the mask downsampler.
+    mask_downsampler_stride (`int`, *optional*, defaults to 2):
+        The stride for the mask downsampler.
+    mask_downsampler_padding (`int`, *optional*, defaults to 1):
+        The padding for the mask downsampler.
+    mask_downsampler_total_stride (`int`, *optional*, defaults to 16):
+        The total stride for the mask downsampler.
+    mask_downsampler_hidden_act (`str`, *optional*, defaults to `"gelu"`):
+        The non-linear activation function in the mask downsampler.
+    memory_fuser_num_layers (`int`, *optional*, defaults to 2):
+        The number of layers in the memory fuser.
+    memory_fuser_embed_dim (`int`, *optional*, defaults to 256):
+        The dimension of the memory fuser embedding.
+    memory_fuser_kernel_size (`int`, *optional*, defaults to 7):
+        The kernel size for the memory fuser.
+    memory_fuser_padding (`int`, *optional*, defaults to 3):
+        The padding for the memory fuser.
+    memory_fuser_layer_scale_init_value (`float`, *optional*, defaults to 1e-06):
+        The initial value for the layer scale in the memory fuser.
+    memory_fuser_hidden_act (`str`, *optional*, defaults to `"gelu"`):
+        The non-linear activation function in the memory fuser.
 
     Example:
 
@@ -218,139 +207,90 @@ class EdgeTamVideoConfig(Sam2VideoConfig):
         "mask_decoder_config": EdgeTamVideoMaskDecoderConfig,
     }
 
-    def __init__(
-        self,
-        vision_config=None,
-        prompt_encoder_config=None,
-        mask_decoder_config=None,
-        initializer_range=0.02,
-        num_maskmem=7,
-        image_size=1024,
-        sigmoid_scale_for_mem_enc=20.0,
-        sigmoid_bias_for_mem_enc=-10.0,
-        enable_occlusion_spatial_embedding=True,
-        multimask_output_in_sam=True,
-        multimask_min_pt_num=0,
-        multimask_max_pt_num=1,
-        multimask_output_for_tracking=True,
-        max_object_pointers_in_encoder=16,
-        enable_temporal_pos_encoding_for_object_pointers=True,
-        # memory attention
-        memory_attention_hidden_size=256,
-        memory_attention_num_layers=2,
-        memory_attention_num_attention_heads=1,
-        memory_attention_downsample_rate=1,
-        memory_attention_mlp_hidden_size=2048,
-        memory_attention_mlp_hidden_act="relu",
-        memory_attention_dropout=0.1,
-        memory_attention_rope_theta=10000,
-        memory_attention_rope_feat_sizes=None,
-        memory_attention_rope_k_sizes=None,
-        memory_attention_rope_dropout=0.1,
-        # spatial perceiver resampler
-        perceiver_resampler_num_latents=256,
-        perceiver_resampler_num_latents_2d=256,
-        perceiver_resampler_hidden_size=64,
-        perceiver_resampler_mlp_intermediate_size=256,
-        perceiver_resampler_num_attention_heads=1,
-        perceiver_resampler_attention_head_dim=64,
-        perceiver_resampler_num_layers=2,
-        perceiver_resampler_hidden_dropout=0.0,
-        perceiver_resampler_attention_dropout=0.0,
-        # memory encoder
-        memory_encoder_hidden_size=256,
-        memory_encoder_output_channels=64,
-        mask_downsampler_embed_dim=256,
-        memory_fuser_intermediate_dim=1024,
-        mask_downsampler_kernel_size=3,
-        mask_downsampler_stride=2,
-        mask_downsampler_padding=1,
-        mask_downsampler_total_stride=16,
-        mask_downsampler_hidden_act="gelu",
-        memory_fuser_num_layers=2,
-        memory_fuser_embed_dim=256,
-        memory_fuser_kernel_size=7,
-        memory_fuser_padding=3,
-        memory_fuser_layer_scale_init_value=1e-6,
-        memory_fuser_hidden_act="gelu",
-        **kwargs,
-    ):
-        PreTrainedConfig.__init__(**kwargs)
-        vision_config = vision_config if vision_config is not None else {}
-        prompt_encoder_config = prompt_encoder_config if prompt_encoder_config is not None else {}
-        mask_decoder_config = mask_decoder_config if mask_decoder_config is not None else {}
-        memory_attention_rope_feat_sizes = (
-            [64, 64] if memory_attention_rope_feat_sizes is None else memory_attention_rope_feat_sizes
+    vision_config: dict | PreTrainedConfig | None = None
+    prompt_encoder_config: dict | PreTrainedConfig | None = None
+    mask_decoder_config: dict | PreTrainedConfig | None = None
+    initializer_range: float = 0.02
+    num_maskmem: int = 7
+    image_size: int | list[int] | tuple[int, int] = 1024
+    sigmoid_scale_for_mem_enc: float = 20.0
+    sigmoid_bias_for_mem_enc: float = -10.0
+    enable_occlusion_spatial_embedding: bool = True
+    multimask_output_in_sam: bool = True
+    multimask_min_pt_num: int = 0
+    multimask_max_pt_num: int = 1
+    multimask_output_for_tracking: bool = True
+    max_object_pointers_in_encoder: int = 16
+    max_cond_frame_num: int = -1
+    enable_temporal_pos_encoding_for_object_pointers: bool = True
+
+    # memory attention
+    memory_attention_hidden_size: int = 256
+    memory_attention_num_layers: int = 2
+    memory_attention_num_attention_heads: int = 1
+    memory_attention_downsample_rate: int = 1
+    memory_attention_mlp_hidden_size: int = 2048
+    memory_attention_mlp_hidden_act: str = "relu"
+    memory_attention_dropout: float | int = 0.1
+    memory_attention_rope_theta: float | int = 10000
+    memory_attention_rope_feat_sizes: list | None = None
+    memory_attention_rope_k_sizes: list | None = None
+    memory_attention_rope_dropout: float | int = 0.1
+
+    # spatial perceiver resampler
+    perceiver_resampler_num_latents: int = 256
+    perceiver_resampler_num_latents_2d: int = 256
+    perceiver_resampler_hidden_size: int = 64
+    perceiver_resampler_mlp_intermediate_size: int = 256
+    perceiver_resampler_num_attention_heads: int = 1
+    perceiver_resampler_attention_head_dim: int = 64
+    perceiver_resampler_num_layers: int = 2
+    perceiver_resampler_hidden_dropout: float | int = 0.0
+    perceiver_resampler_attention_dropout: float | int = 0.0
+
+    # memory encoder
+    memory_encoder_hidden_size: int = 256
+    memory_encoder_output_channels: int = 64
+    mask_downsampler_embed_dim: int = 256
+    memory_fuser_intermediate_dim: int = 1024
+    mask_downsampler_kernel_size: int = 3
+    mask_downsampler_stride: int = 2
+    mask_downsampler_padding: int = 1
+    mask_downsampler_total_stride: int = 16
+    mask_downsampler_hidden_act: str = "gelu"
+    memory_fuser_num_layers: int = 2
+    memory_fuser_embed_dim: int = 256
+    memory_fuser_kernel_size: int = 7
+    memory_fuser_padding: int = 3
+    memory_fuser_layer_scale_init_value: float = 1e-6
+    memory_fuser_hidden_act: str = "gelu"
+
+    def __post_init__(self, **kwargs):
+        self.prompt_encoder_config = self.prompt_encoder_config if self.prompt_encoder_config is not None else {}
+        self.mask_decoder_config = self.mask_decoder_config if self.mask_decoder_config is not None else {}
+        self.memory_attention_rope_feat_sizes = (
+            [64, 64] if self.memory_attention_rope_feat_sizes is None else self.memory_attention_rope_feat_sizes
         )
-        memory_attention_rope_k_sizes = (
-            [16, 16] if memory_attention_rope_k_sizes is None else memory_attention_rope_k_sizes
+        self.memory_attention_rope_k_sizes = (
+            [16, 16] if self.memory_attention_rope_k_sizes is None else self.memory_attention_rope_k_sizes
         )
 
-        if isinstance(vision_config, dict):
-            vision_config["model_type"] = vision_config.get("model_type", "sam2_vision_model")
-            vision_config = CONFIG_MAPPING[vision_config["model_type"]](**vision_config)
-        if isinstance(prompt_encoder_config, EdgeTamVideoPromptEncoderConfig):
-            prompt_encoder_config = prompt_encoder_config.to_dict()
-        if isinstance(mask_decoder_config, EdgeTamVideoMaskDecoderConfig):
-            mask_decoder_config = mask_decoder_config.to_dict()
+        if isinstance(self.vision_config, dict):
+            self.vision_config["model_type"] = self.vision_config.get("model_type", "sam2_vision_model")
+            self.vision_config = CONFIG_MAPPING[self.vision_config["model_type"]](**self.vision_config)
+        elif self.vision_config is None:
+            self.vision_config = CONFIG_MAPPING["sam2_vision_model"]()
 
-        self.vision_config = vision_config
-        self.prompt_encoder_config = EdgeTamVideoPromptEncoderConfig(**prompt_encoder_config)
-        self.mask_decoder_config = EdgeTamVideoMaskDecoderConfig(**mask_decoder_config)
+        if isinstance(self.prompt_encoder_config, dict):
+            self.prompt_encoder_config = EdgeTamVideoPromptEncoderConfig(**self.prompt_encoder_config)
+        elif self.prompt_encoder_config is None:
+            self.prompt_encoder_config = EdgeTamVideoPromptEncoderConfig()
 
-        self.initializer_range = initializer_range
-        self.num_maskmem = num_maskmem  # default 1 input frame + 6 previous frames
-        self.image_size = image_size
-        self.sigmoid_scale_for_mem_enc = sigmoid_scale_for_mem_enc  # scale factor for mask sigmoid prob
-        self.sigmoid_bias_for_mem_enc = sigmoid_bias_for_mem_enc  # bias factor for mask sigmoid prob
-        self.enable_occlusion_spatial_embedding = enable_occlusion_spatial_embedding
-        self.multimask_output_in_sam = multimask_output_in_sam
-        self.multimask_min_pt_num = multimask_min_pt_num
-        self.multimask_max_pt_num = multimask_max_pt_num
-        self.multimask_output_for_tracking = multimask_output_for_tracking
-        self.max_object_pointers_in_encoder = max_object_pointers_in_encoder
-        self.enable_temporal_pos_encoding_for_object_pointers = enable_temporal_pos_encoding_for_object_pointers
-
-        # memory attention
-        self.memory_attention_hidden_size = memory_attention_hidden_size
-        self.memory_attention_num_layers = memory_attention_num_layers
-        self.memory_attention_num_attention_heads = memory_attention_num_attention_heads
-        self.memory_attention_downsample_rate = memory_attention_downsample_rate
-        self.memory_attention_mlp_hidden_size = memory_attention_mlp_hidden_size
-        self.memory_attention_mlp_hidden_act = memory_attention_mlp_hidden_act
-        self.memory_attention_dropout = memory_attention_dropout
-        self.memory_attention_rope_theta = memory_attention_rope_theta
-        self.memory_attention_rope_feat_sizes = memory_attention_rope_feat_sizes
-        self.memory_attention_rope_k_sizes = memory_attention_rope_k_sizes
-        self.memory_attention_rope_dropout = memory_attention_rope_dropout
-
-        # spatial perceiver resampler
-        self.perceiver_resampler_num_latents = perceiver_resampler_num_latents
-        self.perceiver_resampler_num_latents_2d = perceiver_resampler_num_latents_2d
-        self.perceiver_resampler_hidden_size = perceiver_resampler_hidden_size
-        self.perceiver_resampler_mlp_intermediate_size = perceiver_resampler_mlp_intermediate_size
-        self.perceiver_resampler_attention_head_dim = perceiver_resampler_attention_head_dim
-        self.perceiver_resampler_num_attention_heads = perceiver_resampler_num_attention_heads
-        self.perceiver_resampler_num_layers = perceiver_resampler_num_layers
-        self.perceiver_resampler_hidden_dropout = perceiver_resampler_hidden_dropout
-        self.perceiver_resampler_attention_dropout = perceiver_resampler_attention_dropout
-
-        # memory encoder
-        self.memory_encoder_hidden_size = memory_encoder_hidden_size
-        self.memory_encoder_output_channels = memory_encoder_output_channels
-        self.mask_downsampler_embed_dim = mask_downsampler_embed_dim
-        self.mask_downsampler_kernel_size = mask_downsampler_kernel_size
-        self.mask_downsampler_stride = mask_downsampler_stride
-        self.mask_downsampler_padding = mask_downsampler_padding
-        self.mask_downsampler_total_stride = mask_downsampler_total_stride
-        self.mask_downsampler_hidden_act = mask_downsampler_hidden_act
-        self.memory_fuser_num_layers = memory_fuser_num_layers
-        self.memory_fuser_embed_dim = memory_fuser_embed_dim
-        self.memory_fuser_intermediate_dim = memory_fuser_intermediate_dim
-        self.memory_fuser_kernel_size = memory_fuser_kernel_size
-        self.memory_fuser_padding = memory_fuser_padding
-        self.memory_fuser_layer_scale_init_value = memory_fuser_layer_scale_init_value
-        self.memory_fuser_hidden_act = memory_fuser_hidden_act
+        if isinstance(self.mask_decoder_config, dict):
+            self.mask_decoder_config = EdgeTamVideoMaskDecoderConfig(**self.mask_decoder_config)
+        elif self.mask_decoder_config is None:
+            self.mask_decoder_config = EdgeTamVideoMaskDecoderConfig()
+        super().__post_init__(**kwargs)
 
 
 class EdgeTamVideoLayerNorm(Sam2VideoLayerNorm):
@@ -366,26 +306,19 @@ class EdgeTamVideoVisionEncoderOutput(Sam2VideoVisionEncoderOutput):
 
 
 class EdgeTamVideoVisionRotaryEmbedding(Sam2VideoVisionRotaryEmbedding):
-    def __init__(self, config: EdgeTamVideoConfig, end_x: Optional[int] = None, end_y: Optional[int] = None):
+    def __init__(self, config: EdgeTamVideoConfig, end_x: int | None = None, end_y: int | None = None):
         nn.Module.__init__()
-        dim = config.memory_attention_hidden_size // (
+        self.dim = config.memory_attention_hidden_size // (
             config.memory_attention_downsample_rate * config.memory_attention_num_attention_heads
         )
         # Ensure even dimension for proper axial splitting
-        if dim % 4 != 0:
+        if self.dim % 4 != 0:
             raise ValueError("Dimension must be divisible by 4 for axial RoPE")
-        end_x, end_y = config.memory_attention_rope_feat_sizes if end_x is None else (end_x, end_y)
-        freqs = 1.0 / (config.memory_attention_rope_theta ** (torch.arange(0, dim, 4)[: (dim // 4)].float() / dim))
+        self.end_x, self.end_y = config.memory_attention_rope_feat_sizes if end_x is None else (end_x, end_y)
+        self.memory_attention_rope_theta = config.memory_attention_rope_theta
 
-        # Generate 2D position indices for axial rotary embedding
-        flattened_indices = torch.arange(end_x * end_y, dtype=torch.long)
-        x_positions = flattened_indices % end_x
-        y_positions = torch.div(flattened_indices, end_x, rounding_mode="floor")
-        freqs_x = torch.outer(x_positions, freqs).float()
-        freqs_y = torch.outer(y_positions, freqs).float()
-        inv_freq = torch.cat([freqs_x, freqs_y], dim=-1)
-        inv_freq = inv_freq.repeat_interleave(2, dim=-1)
         # directly register the cos and sin embeddings as we have a fixed feature shape
+        inv_freq = self.create_inv_freq()
         self.register_buffer("rope_embeddings_cos", inv_freq.cos(), persistent=False)
         self.register_buffer("rope_embeddings_sin", inv_freq.sin(), persistent=False)
 
@@ -537,9 +470,9 @@ class EdgeTamVideoRoPESelfAttention(nn.Module):
         # Apply rotary position encoding for self-attention
         query, key = apply_rotary_pos_emb_2d_self_attn(query, key, cos=cos, sin=sin)
 
-        attention_interface: Callable = eager_attention_forward
-        if self.config._attn_implementation != "eager":
-            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
+            self.config._attn_implementation, eager_attention_forward
+        )
 
         attn_output, attn_weights = attention_interface(
             self,
@@ -613,9 +546,9 @@ class EdgeTamVideoRoPECrossAttention(nn.Module):
             num_k_exclude_rope=num_k_exclude_rope,
         )
 
-        attention_interface: Callable = eager_attention_forward
-        if self.config._attn_implementation != "eager":
-            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
+            self.config._attn_implementation, eager_attention_forward
+        )
 
         attn_output, attn_weights = attention_interface(
             self,
@@ -641,9 +574,10 @@ class EdgeTamVideoTwoWayAttentionBlock(Sam2VideoTwoWayAttentionBlock):
 
 class EdgeTamVideoPositionEmbeddingSine(Sam2VideoPositionEmbeddingSine):
     # maxsize=2 because we need to cache the forward method for both memory encoder and perceiver resampler
+    @staticmethod
     @compile_compatible_method_lru_cache(maxsize=2)
-    def forward(self, **super_kwargs):
-        return super().forward(**super_kwargs)
+    def build_sine_position_embedding(**super_kwargs) -> torch.Tensor:
+        return super().build_sine_position_embedding(**super_kwargs)
 
 
 class EdgeTamVideoMemoryEncoder(Sam2VideoMemoryEncoder):
@@ -655,7 +589,12 @@ class EdgeTamVideoFeedForward(Sam2VideoFeedForward):
 
 
 class EdgeTamVideoPreTrainedModel(Sam2VideoPreTrainedModel):
-    pass
+    def _init_weights(self, module):
+        super()._init_weights()
+        if isinstance(module, EdgeTamVideoVisionRotaryEmbedding):
+            inv_freq = module.create_inv_freq()
+            init.copy_(module.rope_embeddings_cos, inv_freq.cos())
+            init.copy_(module.rope_embeddings_sin, inv_freq.sin())
 
 
 class EdgeTamVideoInferenceSession(Sam2VideoInferenceSession):
@@ -700,7 +639,7 @@ class EdgeTamVideoMemoryAttentionLayer(nn.Module):
         keys: Tensor,
         key_point_embedding: Tensor,
         rope_position_embeddings: tuple[Tensor, Tensor],
-        rope_position_embeddings_k: Optional[tuple[Tensor, Tensor]] = None,
+        rope_position_embeddings_k: tuple[Tensor, Tensor] | None = None,
         num_k_exclude_rope: int = 0,
         rope_k_repeat: int = 0,
     ) -> torch.Tensor:
@@ -739,8 +678,8 @@ class EdgeTamVideoMemoryAttention(Sam2VideoMemoryAttention):
         self,
         current_vision_features: torch.Tensor,
         memory: torch.Tensor,
-        current_vision_position_embeddings: Optional[Tensor] = None,
-        memory_posision_embeddings: Optional[Tensor] = None,
+        current_vision_position_embeddings: Tensor | None = None,
+        memory_posision_embeddings: Tensor | None = None,
         num_object_pointer_tokens: int = 0,
         num_spatial_memory_tokens: int = -1,
     ):
@@ -826,7 +765,7 @@ class EdgeTamVideoPerceiverAttention(nn.Module):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        positional_encoding: Optional[torch.Tensor] = None,
+        positional_encoding: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
         # Project queries, keys, and values
@@ -850,9 +789,9 @@ class EdgeTamVideoPerceiverAttention(nn.Module):
             value = value + pos_encoding
 
         # Apply attention
-        attention_interface: Callable = eager_attention_forward
-        if self.config._attn_implementation != "eager":
-            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
+            self.config._attn_implementation, eager_attention_forward
+        )
 
         attn_output, _ = attention_interface(
             self,
@@ -891,7 +830,7 @@ class EdgeTamVideoPerceiverEncoderLayer(nn.Module):
         self,
         latents: torch.Tensor,
         input_features: torch.Tensor,
-        positional_encoding: Optional[torch.Tensor] = None,
+        positional_encoding: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # Cross attention with layer norms
         normalized_latents = self.layer_norm_latents(latents)
@@ -935,7 +874,7 @@ class EdgeTamVideoPerceiverResampler(nn.Module):
             self.latents_2d = nn.Parameter(torch.randn(self.num_latents_2d, self.hidden_size))
 
         self.positional_encoding = EdgeTamVideoPositionEmbeddingSine(
-            num_pos_feats=self.hidden_size // 2, normalize=True
+            num_position_features=self.hidden_size // 2, normalize=True
         )
 
         self.layers = nn.ModuleList([EdgeTamVideoPerceiverEncoderLayer(config) for _ in range(self.num_layers)])
@@ -945,8 +884,8 @@ class EdgeTamVideoPerceiverResampler(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        positional_encoding: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        positional_encoding: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         output_latents = []
         output_positional_encodings = []
 
@@ -971,8 +910,8 @@ class EdgeTamVideoPerceiverResampler(nn.Module):
     def _forward_1d(
         self,
         hidden_states: torch.Tensor,
-        positional_encoding: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        positional_encoding: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         batch_size = hidden_states.shape[0]
 
         latents = self.latents_1d.unsqueeze(0).expand(batch_size, -1, -1)
@@ -1023,11 +962,16 @@ class EdgeTamVideoPerceiverResampler(nn.Module):
         return latents_2d, positional_encoding_2d
 
 
+class EdgeTamVideoImageSegmentationOutput(Sam2VideoImageSegmentationOutput):
+    pass
+
+
+class EdgeTamVideoSegmentationOutput(Sam2VideoSegmentationOutput):
+    pass
+
+
 @auto_docstring
 class EdgeTamVideoModel(Sam2VideoModel):
-    _tied_weights_keys = ["prompt_encoder.shared_embedding.positional_embedding"]
-    # need to be ignored, as it's a buffer and will not be correctly detected as tied weight
-    _keys_to_ignore_on_load_missing = ["prompt_encoder.shared_embedding.positional_embedding"]
     _keys_to_ignore_on_load_unexpected = []
     _can_record_outputs = {"mask_decoder_attentions": OutputRecorder(EdgeTamVideoTwoWayAttentionBlock, index=2)}
 
@@ -1187,7 +1131,7 @@ class EdgeTamVideoModel(Sam2VideoModel):
 
         # Reshape from (Batch, H*W, Channels) to (Batch, Channels, Height, Width)
         conditioned_feature_map = (
-            conditioned_feature_map_flat.squeeze(1).permute(0, 2, 1).view(batch_size, num_channels, height, width)
+            conditioned_feature_map_flat.squeeze(1).transpose(1, 2).view(batch_size, num_channels, height, width)
         )
         return conditioned_feature_map
 
@@ -1232,6 +1176,276 @@ class EdgeTamVideoModel(Sam2VideoModel):
         maskmem_pos_enc = maskmem_pos_enc.to(pred_masks_high_res.dtype)
 
         return maskmem_features, maskmem_pos_enc
+
+    def forward(
+        self,
+        inference_session: EdgeTamVideoInferenceSession,
+        frame_idx: int | None = None,
+        frame: torch.Tensor | None = None,
+        reverse: bool = False,
+        **kwargs,
+    ) -> EdgeTamVideoSegmentationOutput:
+        r"""
+        inference_session (`EdgeTamVideoInferenceSession`):
+            The video inference session object.
+        frame_idx (`int`, *optional*):
+            The index of the frame on which to run inference. No need to provide when inferring
+            on a new streamed frame.
+        frame (`torch.Tensor`, *optional*):
+            The frame to process. Provide when streaming.
+        reverse (`bool`, *optional*, defaults to `False`):
+            Whether to propagate in reverse.
+        """
+        if frame is not None:
+            frame_idx = inference_session.add_new_frame(frame, frame_idx)
+
+        if frame is not None and inference_session.get_obj_num() == 0:
+            raise ValueError("No objects are provided for tracking; please add inputs first.")
+
+        num_objects = inference_session.get_obj_num()
+        pred_masks_per_obj = [None] * num_objects
+        object_score_logits_per_obj = [None] * num_objects
+        # Note: We avoid batched inference here because per-object inputs (clicks/masks)
+        # can differ across objects.
+        for obj_idx in range(num_objects):
+            obj_id = inference_session.obj_idx_to_id(obj_idx)
+            has_new_inputs = obj_id in inference_session.obj_with_new_inputs
+            has_cond_output = frame_idx in inference_session.output_dict_per_obj[obj_idx]["cond_frame_outputs"]
+            # If this object has no new inputs and this frame already has a
+            # conditioning output, reuse the cached masks instead of recomputing.
+            if (not has_new_inputs) and has_cond_output:
+                pred_masks = inference_session.get_output(obj_idx, frame_idx, "pred_masks", is_conditioning_frame=True)
+                object_score_logits = inference_session.get_output(
+                    obj_idx, frame_idx, "object_score_logits", is_conditioning_frame=True
+                )
+                is_init_cond_frame = True
+            else:
+                # Defaults when there are no new inputs
+                is_init_cond_frame = False
+                point_inputs = None
+                mask_inputs = None
+
+                if has_new_inputs:
+                    is_init_cond_frame = frame_idx not in inference_session.frames_tracked_per_obj[obj_idx]
+                    if is_init_cond_frame:
+                        reverse = False
+                    point_inputs = inference_session.point_inputs_per_obj[obj_idx].get(frame_idx, None)
+                    mask_inputs = inference_session.mask_inputs_per_obj[obj_idx].get(frame_idx, None)
+                    if point_inputs is not None or mask_inputs is not None:
+                        inference_session.obj_with_new_inputs.remove(obj_id)
+
+                current_out = self._run_single_frame_inference(
+                    inference_session=inference_session,
+                    obj_idx=obj_idx,
+                    frame_idx=frame_idx,
+                    batch_size=1,  # run on the slice of a single object
+                    is_init_cond_frame=is_init_cond_frame,
+                    point_inputs=point_inputs,
+                    mask_inputs=mask_inputs,
+                    reverse=reverse,
+                    run_mem_encoder=True,
+                    streaming=frame is not None,
+                )
+                inference_session.store_output(
+                    obj_idx, frame_idx, output_value=current_out, is_conditioning_frame=is_init_cond_frame
+                )
+                pred_masks = current_out["pred_masks"]
+                object_score_logits = current_out["object_score_logits"]
+
+            pred_masks_per_obj[obj_idx] = pred_masks
+            object_score_logits_per_obj[obj_idx] = object_score_logits.squeeze(-1)
+            if not is_init_cond_frame:
+                # only for tracked frames, not for initial conditioning frames
+                inference_session.frames_tracked_per_obj[obj_idx][frame_idx] = {"reverse": reverse}
+
+        # Resize the output mask to the original video resolution (we directly use
+        # the mask scores on GPU for output to avoid any CPU conversion in between)
+        if len(pred_masks_per_obj) > 1:
+            all_pred_masks = torch.cat(pred_masks_per_obj, dim=0)
+            all_object_score_logits = torch.cat(object_score_logits_per_obj, dim=0)
+        else:
+            all_pred_masks = pred_masks_per_obj[0]
+            all_object_score_logits = object_score_logits_per_obj[0]
+
+        return EdgeTamVideoSegmentationOutput(
+            object_ids=inference_session.obj_ids.copy(),
+            pred_masks=all_pred_masks,
+            object_score_logits=all_object_score_logits,
+            frame_idx=frame_idx,
+        )
+
+    def _use_mask_as_output(
+        self,
+        backbone_features: torch.Tensor,
+        high_res_features: list[torch.Tensor],
+        mask_inputs: torch.Tensor,
+    ) -> EdgeTamVideoImageSegmentationOutput:
+        """
+        Directly turn binary `mask_inputs` into a output mask logits without using SAM.
+        (same input and output shapes as in forward above).
+        """
+        # Use -10/+20 as logits for neg/pos pixels (very close to 0/1 in prob after sigmoid).
+        out_scale, out_bias = 20.0, -10.0  # sigmoid(-10.0)=4.5398e-05
+        mask_inputs_float = mask_inputs.to(backbone_features[0].dtype)
+        high_res_masks = mask_inputs_float * out_scale + out_bias
+        low_res_masks = F.interpolate(
+            high_res_masks.float(),
+            size=(high_res_masks.size(-2) // 4, high_res_masks.size(-1) // 4),
+            align_corners=False,
+            mode="bilinear",
+            antialias=True,  # use antialias for downsampling
+        ).to(backbone_features[0].dtype)
+        # a dummy IoU prediction of all 1's under mask input
+        iou_scores = mask_inputs.new_ones(mask_inputs.size(0), 1).to(backbone_features[0].dtype)
+        # produce an object pointer using the SAM decoder from the mask input
+        object_pointer = self._single_frame_forward(
+            input_masks=self.mask_downsample(mask_inputs_float.to(backbone_features[0].dtype)),
+            image_embeddings=high_res_features + [backbone_features],
+        ).object_pointer
+        # In this method, we are treating mask_input as output, e.g. using it directly to create spatial mem;
+        # Below, we follow the same design axiom to use mask_input to decide if obj appears or not instead of relying
+        # on the object_scores from the SAM decoder.
+        is_obj_appearing = torch.any(mask_inputs.flatten(1).float() > 0.0, dim=1)
+        is_obj_appearing = is_obj_appearing[..., None]
+        lambda_is_obj_appearing = is_obj_appearing.to(backbone_features[0].dtype)
+        object_score_logits = out_scale * lambda_is_obj_appearing + out_bias
+        object_pointer = lambda_is_obj_appearing * object_pointer
+        object_pointer = object_pointer + (1 - lambda_is_obj_appearing) * self.no_object_pointer
+        return EdgeTamVideoImageSegmentationOutput(
+            iou_scores=iou_scores,
+            pred_masks=low_res_masks,
+            high_res_masks=high_res_masks,
+            object_pointer=object_pointer,
+            object_score_logits=object_score_logits,
+            image_embeddings=high_res_features + [backbone_features],
+        )
+
+    def _run_single_frame_inference(
+        self,
+        inference_session: EdgeTamVideoInferenceSession,
+        frame_idx: int,
+        obj_idx: int,
+        batch_size: int,
+        is_init_cond_frame: bool,
+        point_inputs: torch.Tensor | None,
+        mask_inputs: torch.Tensor | None,
+        reverse: bool,
+        run_mem_encoder: bool,
+        prev_sam_mask_logits: torch.Tensor | None = None,
+        streaming: bool = False,
+    ) -> dict[str, Any]:
+        """
+        Perform a single tracking step for video object segmentation.
+
+        Args:
+            inference_session (`EdgeTamVideoInferenceSession`):
+                The video inference session object.
+            frame_idx (`int`):
+                Index of the current frame.
+            obj_idx (`int`):
+                Index of the current object.
+            batch_size (`int`):
+                Batch size of the current frame.
+            is_init_cond_frame (`bool`):
+                Whether this is an initial conditioning frame with user inputs.
+            point_inputs (`dict`, *optional*):
+                Point prompt inputs for the current frame.
+            mask_inputs (`torch.Tensor`, *optional*):
+                Mask prompt inputs for the current frame.
+            reverse (`bool`, *optional*, defaults to `False`):
+                Whether to track in reverse time order.
+            run_mem_encoder (`bool`, *optional*, defaults to `True`):
+                Whether to run the memory encoder on predicted masks.
+            prev_sam_mask_logits (`torch.Tensor`, *optional*):
+                Previously predicted SAM mask logits that can be fed with new clicks.
+            streaming (`bool`, *optional*, defaults to `False`):
+                Whether this is streaming inference.
+
+        Returns:
+            `dict`: Dictionary containing the tracking results for the current frame, including:
+                - pred_masks: Predicted low-resolution masks.
+                - object_pointer: Object pointer for memory.
+                - object_score_logits: Object score logits (inference only).
+                - maskmem_features: Memory features for future frames.
+                - maskmem_pos_enc: Memory positional encodings.
+        """
+        # Retrieve correct image features
+        current_vision_feats, current_vision_pos_embeds = self._prepare_vision_features(
+            inference_session, frame_idx, batch_size
+        )
+        # point and mask should not appear as input simultaneously on the same frame
+        if point_inputs is not None and mask_inputs is not None:
+            raise ValueError(
+                "point_inputs and mask_inputs should not appear as input simultaneously on the same frame"
+            )
+        # High-resolution feature maps for the SAM head, reshape (HW)BC => BCHW
+        if len(current_vision_feats) > 1:
+            high_res_features = [
+                x.permute(1, 2, 0).view(x.size(1), x.size(2), *s)
+                for x, s in zip(current_vision_feats[:-1], self.backbone_feature_sizes[:-1])
+            ]
+        else:
+            high_res_features = None
+        if mask_inputs is not None:
+            # We directly output the mask input (see it as a GT mask) without using a SAM prompt encoder + mask decoder.
+            pix_feat = current_vision_feats[-1].permute(1, 2, 0)
+            pix_feat = pix_feat.view(-1, self.hidden_dim, *self.backbone_feature_sizes[-1])
+            sam_outputs = self._use_mask_as_output(pix_feat, high_res_features, mask_inputs)
+        else:
+            # fused the visual feature with previous memory features in the memory bank
+            pix_feat = self._prepare_memory_conditioned_features(
+                inference_session=inference_session,
+                frame_idx=frame_idx,
+                obj_idx=obj_idx,
+                is_initial_conditioning_frame=is_init_cond_frame,
+                current_vision_features=current_vision_feats[-1],
+                current_vision_positional_embeddings=current_vision_pos_embeds[-1],
+                num_total_frames=inference_session.num_frames,
+                track_in_reverse_time=reverse,
+                streaming=streaming,
+            )
+            # apply SAM-style segmentation head
+            # here we might feed previously predicted low-res SAM mask logits into the SAM mask decoder,
+            # e.g. in demo where such logits come from earlier interaction instead of correction sampling
+            # (in this case, any `mask_inputs` shouldn't reach here as they are sent to _use_mask_as_output instead)
+            if prev_sam_mask_logits is not None:
+                mask_inputs = prev_sam_mask_logits
+            multimask_output = self._use_multimask(is_init_cond_frame, point_inputs)
+            sam_outputs = self._single_frame_forward(
+                pixel_values=None,  # Vision features already computed
+                input_points=point_inputs["point_coords"] if point_inputs is not None else None,
+                input_labels=point_inputs["point_labels"] if point_inputs is not None else None,
+                input_masks=mask_inputs,
+                image_embeddings=high_res_features + [pix_feat],
+                multimask_output=multimask_output,
+            )
+
+        # Finally run the memory encoder on the predicted mask to encode
+        # it into a new memory feature (which will be used to condition vision features in future frames)
+        maskmem_features = None
+        maskmem_pos_enc = None
+        if run_mem_encoder and self.num_maskmem > 0:
+            maskmem_features, maskmem_pos_enc = self._encode_new_memory(
+                current_vision_feats=current_vision_feats[-1],
+                pred_masks_high_res=sam_outputs.high_res_masks,
+                object_score_logits=sam_outputs.object_score_logits,
+                is_mask_from_pts=(point_inputs is not None or mask_inputs is not None),
+            )
+
+        current_out = {
+            "pred_masks": sam_outputs.pred_masks,
+            "object_pointer": sam_outputs.object_pointer,
+            "maskmem_features": maskmem_features if maskmem_features is not None else None,
+            "maskmem_pos_enc": maskmem_pos_enc,
+        }
+        if not self.training:
+            current_out["object_score_logits"] = sam_outputs.object_score_logits
+
+        return current_out
+
+    def _batch_encode_memories(self):
+        raise NotImplementedError("Batch memory encoding is not implemented for EdgeTamVideo yet.")
+        # Todo, implement batch memory encoding for edgetam video
 
 
 __all__ = [

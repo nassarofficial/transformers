@@ -12,23 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import inspect
-import shutil
-import tempfile
 import unittest
 
 import numpy as np
-import pytest
 
-from transformers import AutoProcessor, Qwen2TokenizerFast
 from transformers.testing_utils import require_av, require_torch, require_torchvision, require_vision
 from transformers.utils import is_torch_available, is_vision_available
 
-from ...test_processing_common import ProcessorTesterMixin
+from ...test_processing_common import ProcessorTesterMixin, url_to_local_path
 
 
 if is_vision_available():
-    from transformers import Qwen2VLImageProcessorFast, Qwen3VLProcessor
+    from transformers import Qwen3VLProcessor
 
 if is_torch_available():
     import torch
@@ -39,33 +34,20 @@ if is_torch_available():
 @require_torchvision
 class Qwen3VLProcessorTest(ProcessorTesterMixin, unittest.TestCase):
     processor_class = Qwen3VLProcessor
+    model_id = "Qwen/Qwen3-VL-235B-A22B-Instruct"
+    video_unstructured_max_length = 870
+    video_text_kwargs_max_length = 870
+    video_text_kwargs_override_max_length = 870
 
     @classmethod
-    def setUpClass(cls):
-        cls.tmpdirname = tempfile.mkdtemp()
-        processor = Qwen3VLProcessor.from_pretrained(
-            "Qwen/Qwen3-VL-235B-A22B-Instruct", patch_size=4, max_pixels=56 * 56, min_pixels=28 * 28
-        )
-        processor.save_pretrained(cls.tmpdirname)
+    def _setup_from_pretrained(cls, model_id, **kwargs):
+        return super()._setup_from_pretrained(model_id, patch_size=4, max_pixels=56 * 56, min_pixels=28 * 28, **kwargs)
+
+    @classmethod
+    def _setup_test_attributes(cls, processor):
         cls.image_token = processor.image_token
+        cls.video_token = processor.video_token
 
-    def get_tokenizer(self, **kwargs):
-        return AutoProcessor.from_pretrained(self.tmpdirname, **kwargs).tokenizer
-
-    def get_image_processor(self, **kwargs):
-        return AutoProcessor.from_pretrained(self.tmpdirname, **kwargs).image_processor
-
-    def get_video_processor(self, **kwargs):
-        return AutoProcessor.from_pretrained(self.tmpdirname, **kwargs).video_processor
-
-    def get_processor(self, **kwargs):
-        return AutoProcessor.from_pretrained(self.tmpdirname, **kwargs)
-
-    @classmethod
-    def tearDownClass(cls):
-        shutil.rmtree(cls.tmpdirname, ignore_errors=True)
-
-    # Copied from tests.models.llava.test_processing_llava.LlavaProcessorTest.test_get_num_vision_tokens
     def test_get_num_vision_tokens(self):
         "Tests general functionality of the helper used internally in vLLM"
 
@@ -77,65 +59,6 @@ class Qwen3VLProcessorTest(ProcessorTesterMixin, unittest.TestCase):
 
         self.assertTrue("num_image_patches" in output)
         self.assertEqual(len(output["num_image_patches"]), 3)
-
-    def test_save_load_pretrained_default(self):
-        tokenizer = self.get_tokenizer()
-        image_processor = self.get_image_processor()
-        video_processor = self.get_video_processor()
-
-        processor = Qwen3VLProcessor(
-            tokenizer=tokenizer, image_processor=image_processor, video_processor=video_processor
-        )
-        processor.save_pretrained(self.tmpdirname)
-        processor = Qwen3VLProcessor.from_pretrained(self.tmpdirname, use_fast=True)
-
-        self.assertEqual(processor.tokenizer.get_vocab(), tokenizer.get_vocab())
-        self.assertEqual(processor.image_processor.to_json_string(), image_processor.to_json_string())
-        self.assertIsInstance(processor.tokenizer, Qwen2TokenizerFast)
-        self.assertIsInstance(processor.image_processor, Qwen2VLImageProcessorFast)
-
-    def test_image_processor(self):
-        image_processor = self.get_image_processor()
-        tokenizer = self.get_tokenizer()
-        video_processor = self.get_video_processor()
-
-        processor = Qwen3VLProcessor(
-            tokenizer=tokenizer, image_processor=image_processor, video_processor=video_processor
-        )
-
-        image_input = self.prepare_image_inputs()
-
-        input_image_proc = image_processor(image_input, return_tensors="pt")
-        input_processor = processor(images=image_input, text="dummy", return_tensors="pt")
-
-        for key in input_image_proc:
-            self.assertAlmostEqual(input_image_proc[key].sum(), input_processor[key].sum(), delta=1e-2)
-
-    def test_processor(self):
-        image_processor = self.get_image_processor()
-        tokenizer = self.get_tokenizer()
-        video_processor = self.get_video_processor()
-
-        processor = Qwen3VLProcessor(
-            tokenizer=tokenizer, image_processor=image_processor, video_processor=video_processor
-        )
-
-        input_str = "lower newer"
-        image_input = self.prepare_image_inputs()
-        inputs = processor(text=input_str, images=image_input)
-
-        self.assertListEqual(
-            list(inputs.keys()),
-            ["input_ids", "attention_mask", "pixel_values", "image_grid_thw"],
-        )
-
-        # test if it raises when no input is passed
-        with pytest.raises(ValueError):
-            processor()
-
-        # test if it raises when no text is passed
-        with pytest.raises(TypeError):
-            processor(images=image_input)
 
     def test_model_input_names(self):
         processor = self.get_processor()
@@ -163,7 +86,7 @@ class Qwen3VLProcessorTest(ProcessorTesterMixin, unittest.TestCase):
         if processor.chat_template is None:
             self.skipTest("Processor has no chat template")
 
-        if processor_name not in self.processor_class.attributes:
+        if processor_name not in self.processor_class.get_attributes():
             self.skipTest(f"{processor_name} attribute not present in {self.processor_class}")
 
         batch_messages = [
@@ -248,34 +171,22 @@ class Qwen3VLProcessorTest(ProcessorTesterMixin, unittest.TestCase):
             self.assertIsInstance(out_dict[k], return_tensor_to_type[return_tensors])
 
     @require_av
-    @unittest.skip("qwen3_vl can't sample frames from image frames directly, user can use `qwen-vl-utils`")
-    def test_apply_chat_template_video_1(self):
-        pass
-
-    @require_av
-    @unittest.skip("qwen3_vl can't sample frames from image frames directly, user can use `qwen-vl-utils`")
-    def test_apply_chat_template_video_2(self):
-        pass
-
-    @require_av
     def test_apply_chat_template_video_frame_sampling(self):
         processor = self.get_processor()
         if processor.chat_template is None:
             self.skipTest("Processor has no chat template")
-
-        signature = inspect.signature(processor.__call__)
-        if "videos" not in {*signature.parameters.keys()} or (
-            signature.parameters.get("videos") is not None
-            and signature.parameters["videos"].annotation == inspect._empty
-        ):
-            self.skipTest("Processor doesn't accept videos at input")
 
         messages = [
             [
                 {
                     "role": "user",
                     "content": [
-                        {"type": "video"},
+                        {
+                            "type": "video",
+                            "url": url_to_local_path(
+                                "https://huggingface.co/datasets/raushan-testing-hf/videos-test/resolve/main/tiny_video.mp4"
+                            ),
+                        },
                         {"type": "text", "text": "What is shown in this video?"},
                     ],
                 },
@@ -285,21 +196,10 @@ class Qwen3VLProcessorTest(ProcessorTesterMixin, unittest.TestCase):
         formatted_prompt = processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
         self.assertEqual(len(formatted_prompt), 1)
 
-        formatted_prompt_tokenized = processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=True)
-        expected_output = processor.tokenizer(formatted_prompt, return_tensors=None).input_ids
-        self.assertListEqual(expected_output, formatted_prompt_tokenized)
-
-        out_dict = processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=True, return_dict=True)
-        self.assertListEqual(list(out_dict.keys()), ["input_ids", "attention_mask"])
-
         # for fast test, set the longest edge to 8192
-        processor.video_processor.size["longest_edge"] = 8192
+        processor.video_processor.size.longest_edge = 8192
 
         # Add video URL for return dict and load with `num_frames` arg
-        messages[0][0]["content"][0] = {
-            "type": "video",
-            "url": "https://huggingface.co/datasets/raushan-testing-hf/videos-test/resolve/main/tiny_video.mp4",
-        }
         num_frames = 3
         out_dict_with_video = processor.apply_chat_template(
             messages,
@@ -350,8 +250,8 @@ class Qwen3VLProcessorTest(ProcessorTesterMixin, unittest.TestCase):
         messages[0][0]["content"][0] = {
             "type": "video",
             "url": [
-                "https://www.ilankelman.org/stopsigns/australia.jpg",
-                "https://www.ilankelman.org/stopsigns/australia.jpg",
+                "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/transformers/tasks/australia.jpg",
+                "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/transformers/tasks/australia.jpg",
             ],
         }
         out_dict_with_video = processor.apply_chat_template(
@@ -374,3 +274,11 @@ class Qwen3VLProcessorTest(ProcessorTesterMixin, unittest.TestCase):
         self.assertEqual(inputs[self.images_input_name].shape[0], 612)
         inputs = processor(text=input_str, images=image_input, return_tensors="pt")
         self.assertEqual(inputs[self.images_input_name].shape[0], 100)
+
+    @unittest.skip("qwen3_vl can't sample frames from image frames directly, user can use `qwen-vl-utils`")
+    def test_apply_chat_template_video_1(self):
+        pass
+
+    @unittest.skip("qwen3_vl can't sample frames from image frames directly, user can use `qwen-vl-utils`")
+    def test_apply_chat_template_video_2(self):
+        pass

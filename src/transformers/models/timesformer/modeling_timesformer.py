@@ -1,4 +1,3 @@
-# coding=utf-8
 # Copyright 2022 Meta and The HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,13 +14,12 @@
 """PyTorch TimeSformer model."""
 
 import collections
-from typing import Optional, Union
 
 import torch
-import torch.nn.functional
 from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
+from ... import initialization as init
 from ...activations import ACT2FN
 from ...modeling_layers import GradientCheckpointingLayer
 from ...modeling_outputs import BaseModelOutput, ImageClassifierOutput
@@ -146,37 +144,6 @@ class TimesformerEmbeddings(nn.Module):
         return embeddings
 
 
-# Copied from transformers.models.beit.modeling_beit.drop_path
-def drop_path(input: torch.Tensor, drop_prob: float = 0.0, training: bool = False) -> torch.Tensor:
-    """
-    Drop paths (Stochastic Depth) per sample (when applied in main path of residual blocks).
-
-    """
-    if drop_prob == 0.0 or not training:
-        return input
-    keep_prob = 1 - drop_prob
-    shape = (input.shape[0],) + (1,) * (input.ndim - 1)  # work with diff dim tensors, not just 2D ConvNets
-    random_tensor = keep_prob + torch.rand(shape, dtype=input.dtype, device=input.device)
-    random_tensor.floor_()  # binarize
-    output = input.div(keep_prob) * random_tensor
-    return output
-
-
-# Copied from transformers.models.beit.modeling_beit.BeitDropPath with Beit->TimeSformer
-class TimeSformerDropPath(nn.Module):
-    """Drop paths (Stochastic Depth) per sample (when applied in main path of residual blocks)."""
-
-    def __init__(self, drop_prob: Optional[float] = None) -> None:
-        super().__init__()
-        self.drop_prob = drop_prob
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return drop_path(hidden_states, self.drop_prob, self.training)
-
-    def extra_repr(self) -> str:
-        return f"p={self.drop_prob}"
-
-
 # Adapted from https://github.com/facebookresearch/TimeSformer/blob/a5ef29a7b7264baff199a30b3306ac27de901133/timesformer/models/vit.py#L57
 class TimesformerSelfAttention(nn.Module):
     def __init__(self, config: TimesformerConfig):
@@ -240,7 +207,7 @@ class TimeSformerAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         output_attentions: bool = False,
-    ) -> Union[tuple[torch.Tensor, torch.Tensor], tuple[torch.Tensor]]:
+    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor]:
         self_outputs = self.attention(hidden_states, output_attentions)
 
         attention_output = self.output(self_outputs[0])
@@ -282,6 +249,31 @@ class TimesformerOutput(nn.Module):
         return hidden_states
 
 
+# Copied from transformers.models.swin.modular_swin.SwinDropPath with SwinDropPath->TimesformerDropPath
+class TimesformerDropPath(nn.Module):
+    """Stochastic depth (DropPath) per sample, for residual blocks.
+
+    Identity when ``drop_prob`` is 0 or outside training. See `Deep Networks with Stochastic Depth
+    <https://arxiv.org/abs/1603.09382>`_.
+    """
+
+    def __init__(self, drop_prob: float = 0.0) -> None:
+        super().__init__()
+        self.drop_prob = drop_prob
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.drop_prob == 0.0 or not self.training:
+            return hidden_states
+        keep_prob = 1 - self.drop_prob
+        shape = (hidden_states.shape[0],) + (1,) * (hidden_states.ndim - 1)
+        random_tensor = torch.rand(shape, dtype=hidden_states.dtype, device=hidden_states.device)
+        random_tensor = torch.floor(random_tensor + keep_prob)
+        return hidden_states.div(keep_prob) * random_tensor
+
+    def extra_repr(self) -> str:
+        return f"p={self.drop_prob}"
+
+
 # Adapted from https://github.com/facebookresearch/TimeSformer/blob/a5ef29a7b7264baff199a30b3306ac27de901133/timesformer/models/vit.py#L89
 class TimesformerLayer(GradientCheckpointingLayer):
     def __init__(self, config: TimesformerConfig, layer_index: int) -> None:
@@ -294,7 +286,7 @@ class TimesformerLayer(GradientCheckpointingLayer):
         ]  # stochastic depth decay rule
         drop_path_rate = drop_path_rates[layer_index]
 
-        self.drop_path = TimeSformerDropPath(drop_path_rate) if drop_path_rate > 0.0 else nn.Identity()
+        self.drop_path = TimesformerDropPath(drop_path_rate) if drop_path_rate > 0.0 else nn.Identity()
         self.attention = TimeSformerAttention(config)
         self.intermediate = TimesformerIntermediate(config)
         self.output = TimesformerOutput(config)
@@ -419,7 +411,7 @@ class TimesformerEncoder(nn.Module):
         output_attentions: bool = False,
         output_hidden_states: bool = False,
         return_dict: bool = True,
-    ) -> Union[tuple, BaseModelOutput]:
+    ) -> tuple | BaseModelOutput:
         all_hidden_states = () if output_hidden_states else None
         all_self_attentions = () if output_attentions else None
 
@@ -451,22 +443,22 @@ class TimesformerPreTrainedModel(PreTrainedModel):
     config: TimesformerConfig
     base_model_prefix = "timesformer"
     main_input_name = "pixel_values"
-    input_modalities = "image"
+    input_modalities = ("image",)
     supports_gradient_checkpointing = True
     _no_split_modules = ["TimesformerLayer"]
 
+    @torch.no_grad()
     def _init_weights(self, module):
         if isinstance(module, (nn.Linear, nn.Conv2d)):
-            nn.init.trunc_normal_(module.weight, std=self.config.initializer_range)
+            init.trunc_normal_(module.weight, std=self.config.initializer_range)
             if module.bias is not None:
-                nn.init.constant_(module.bias, 0)
+                init.constant_(module.bias, 0)
         elif isinstance(module, nn.LayerNorm):
-            nn.init.constant_(module.bias, 0)
-            nn.init.constant_(module.weight, 1.0)
+            init.constant_(module.bias, 0)
+            init.constant_(module.weight, 1.0)
         elif isinstance(module, TimesformerEmbeddings):
-            nn.init.trunc_normal_(module.cls_token, std=self.config.initializer_range)
-            nn.init.trunc_normal_(module.position_embeddings, std=self.config.initializer_range)
-            module.patch_embeddings.apply(self._init_weights)
+            init.trunc_normal_(module.cls_token, std=self.config.initializer_range)
+            init.trunc_normal_(module.position_embeddings, std=self.config.initializer_range)
 
 
 @auto_docstring
@@ -490,10 +482,11 @@ class TimesformerModel(TimesformerPreTrainedModel):
     def forward(
         self,
         pixel_values: torch.FloatTensor,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-    ) -> Union[tuple[torch.FloatTensor], BaseModelOutput]:
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        return_dict: bool | None = None,
+        **kwargs,
+    ) -> tuple[torch.FloatTensor] | BaseModelOutput:
         r"""
         Examples:
 
@@ -572,7 +565,7 @@ class TimesformerModel(TimesformerPreTrainedModel):
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        return_dict = return_dict if return_dict is not None else self.config.return_dict
 
         embedding_output = self.embeddings(pixel_values)
 
@@ -618,12 +611,13 @@ class TimesformerForVideoClassification(TimesformerPreTrainedModel):
     @auto_docstring
     def forward(
         self,
-        pixel_values: Optional[torch.Tensor] = None,
-        labels: Optional[torch.Tensor] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-    ) -> Union[tuple, ImageClassifierOutput]:
+        pixel_values: torch.Tensor | None = None,
+        labels: torch.Tensor | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        return_dict: bool | None = None,
+        **kwargs,
+    ) -> tuple | ImageClassifierOutput:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
             Labels for computing the image classification/regression loss. Indices should be in `[0, ...,
@@ -706,7 +700,7 @@ class TimesformerForVideoClassification(TimesformerPreTrainedModel):
         >>> print(model.config.id2label[predicted_label])
         eating spaghetti
         ```"""
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        return_dict = return_dict if return_dict is not None else self.config.return_dict
 
         outputs = self.timesformer(
             pixel_values,

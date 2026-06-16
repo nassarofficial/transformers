@@ -1,4 +1,3 @@
-# coding=utf-8
 # Copyright 2025 the HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,7 +16,6 @@
 import unittest
 
 import pytest
-from packaging import version
 from parameterized import parameterized
 
 from transformers import is_torch_available, set_seed
@@ -40,6 +38,7 @@ if is_torch_available():
 
     from transformers import (
         Olmo3ForCausalLM,
+        Olmo3ForSequenceClassification,
         Olmo3Model,
     )
     from transformers.models.olmo3.modeling_olmo3 import Olmo3RotaryEmbedding
@@ -48,6 +47,7 @@ if is_torch_available():
 class Olmo3ModelTester(CausalLMModelTester):
     if is_torch_available():
         base_model_class = Olmo3Model
+        sequence_classification_class = Olmo3ForSequenceClassification
 
 
 @require_torch
@@ -219,9 +219,6 @@ class Olmo3IntegrationTest(unittest.TestCase):
     @pytest.mark.torch_export_test
     @slow
     def test_export_static_cache(self):
-        if version.parse(torch.__version__) < version.parse("2.4.0"):
-            self.skipTest(reason="This test requires torch >= 2.4 to run.")
-
         from transformers.integrations.executorch import (
             TorchExportableModuleWithStaticCache,
             convert_and_export_with_cache,

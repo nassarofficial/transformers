@@ -1,4 +1,3 @@
-# coding=utf-8
 # Copyright 2023 Meta AI and The HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,17 +15,18 @@
 
 import collections.abc
 import math
-from typing import Optional, Union
 
 import torch
 from torch import nn
 
+from ... import initialization as init
 from ...activations import ACT2FN
+from ...backbone_utils import BackboneMixin, filter_output_hidden_states
 from ...modeling_layers import GradientCheckpointingLayer
 from ...modeling_outputs import BackboneOutput, BaseModelOutput
 from ...modeling_utils import PreTrainedModel
 from ...utils import auto_docstring, logging
-from ...utils.backbone_utils import BackboneMixin
+from ...utils.generic import can_return_tuple
 from .configuration_vitdet import VitDetConfig
 
 
@@ -261,37 +261,6 @@ class VitDetAttention(nn.Module):
         return outputs
 
 
-# Copied from transformers.models.beit.modeling_beit.drop_path
-def drop_path(input: torch.Tensor, drop_prob: float = 0.0, training: bool = False) -> torch.Tensor:
-    """
-    Drop paths (Stochastic Depth) per sample (when applied in main path of residual blocks).
-
-    """
-    if drop_prob == 0.0 or not training:
-        return input
-    keep_prob = 1 - drop_prob
-    shape = (input.shape[0],) + (1,) * (input.ndim - 1)  # work with diff dim tensors, not just 2D ConvNets
-    random_tensor = keep_prob + torch.rand(shape, dtype=input.dtype, device=input.device)
-    random_tensor.floor_()  # binarize
-    output = input.div(keep_prob) * random_tensor
-    return output
-
-
-# Copied from transformers.models.beit.modeling_beit.BeitDropPath
-class VitDetDropPath(nn.Module):
-    """Drop paths (Stochastic Depth) per sample (when applied in main path of residual blocks)."""
-
-    def __init__(self, drop_prob: Optional[float] = None) -> None:
-        super().__init__()
-        self.drop_prob = drop_prob
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return drop_path(hidden_states, self.drop_prob, self.training)
-
-    def extra_repr(self) -> str:
-        return f"p={self.drop_prob}"
-
-
 class VitDetLayerNorm(nn.Module):
     """
     A LayerNorm variant, popularized by Transformers, that performs point-wise mean and variance normalization over the
@@ -434,6 +403,31 @@ def window_unpartition(windows, window_size, pad_height_width, height_width):
     return hidden_state
 
 
+# Copied from transformers.models.swin.modular_swin.SwinDropPath with SwinDropPath->VitDetDropPath
+class VitDetDropPath(nn.Module):
+    """Stochastic depth (DropPath) per sample, for residual blocks.
+
+    Identity when ``drop_prob`` is 0 or outside training. See `Deep Networks with Stochastic Depth
+    <https://arxiv.org/abs/1603.09382>`_.
+    """
+
+    def __init__(self, drop_prob: float = 0.0) -> None:
+        super().__init__()
+        self.drop_prob = drop_prob
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.drop_prob == 0.0 or not self.training:
+            return hidden_states
+        keep_prob = 1 - self.drop_prob
+        shape = (hidden_states.shape[0],) + (1,) * (hidden_states.ndim - 1)
+        random_tensor = torch.rand(shape, dtype=hidden_states.dtype, device=hidden_states.device)
+        random_tensor = torch.floor(random_tensor + keep_prob)
+        return hidden_states.div(keep_prob) * random_tensor
+
+    def extra_repr(self) -> str:
+        return f"p={self.drop_prob}"
+
+
 class VitDetLayer(GradientCheckpointingLayer):
     """This corresponds to the Block class in the original implementation."""
 
@@ -476,7 +470,7 @@ class VitDetLayer(GradientCheckpointingLayer):
         self,
         hidden_states: torch.Tensor,
         output_attentions: bool = False,
-    ) -> Union[tuple[torch.Tensor, torch.Tensor], tuple[torch.Tensor]]:
+    ) -> tuple[torch.Tensor, torch.Tensor] | tuple[torch.Tensor]:
         hidden_states = hidden_states.permute(0, 2, 3, 1)
 
         shortcut = hidden_states
@@ -543,7 +537,7 @@ class VitDetEncoder(nn.Module):
         output_attentions: bool = False,
         output_hidden_states: bool = False,
         return_dict: bool = True,
-    ) -> Union[tuple, BaseModelOutput]:
+    ) -> tuple | BaseModelOutput:
         all_hidden_states = () if output_hidden_states else None
         all_self_attentions = () if output_attentions else None
 
@@ -570,71 +564,41 @@ class VitDetEncoder(nn.Module):
         )
 
 
-def caffe2_msra_fill(module: nn.Module) -> None:
-    """
-    Initialize `module.weight` using the "MSRAFill" implemented in Caffe2. Also initializes `module.bias` to 0.
-
-    Source: https://detectron2.readthedocs.io/en/latest/_modules/fvcore/nn/weight_init.html.
-
-    Args:
-        module (torch.nn.Module): module to initialize.
-    """
-    nn.init.kaiming_normal_(module.weight, mode="fan_out", nonlinearity="relu")
-    if module.bias is not None:
-        nn.init.constant_(module.bias, 0)
-
-
 @auto_docstring
 class VitDetPreTrainedModel(PreTrainedModel):
     config: VitDetConfig
     base_model_prefix = "vitdet"
     main_input_name = "pixel_values"
-    input_modalities = "image"
+    input_modalities = ("image",)
     supports_gradient_checkpointing = True
     _no_split_modules = []
 
-    def _init_weights(self, module: Union[nn.Linear, nn.Conv2d, nn.LayerNorm]) -> None:
+    @torch.no_grad()
+    def _init_weights(self, module: nn.Linear | nn.Conv2d | nn.LayerNorm) -> None:
         """Initialize the weights"""
         if isinstance(module, (nn.Linear, nn.Conv2d)):
-            # Upcast the input in `fp32` and cast it back to desired `dtype` to avoid
-            # `trunc_normal_cpu` not implemented in `half` issues
-            module.weight.data = nn.init.trunc_normal_(
-                module.weight.data.to(torch.float32), mean=0.0, std=self.config.initializer_range
-            ).to(module.weight.dtype)
+            init.trunc_normal_(module.weight, mean=0.0, std=self.config.initializer_range)
             if module.bias is not None:
-                module.bias.data.zero_()
+                init.zeros_(module.bias)
         elif isinstance(module, nn.LayerNorm):
-            module.bias.data.zero_()
-            module.weight.data.fill_(1.0)
-
+            init.zeros_(module.bias)
+            init.ones_(module.weight)
         elif isinstance(module, VitDetEmbeddings):
-            module.position_embeddings.data = nn.init.trunc_normal_(
-                module.position_embeddings.data.to(torch.float32),
-                mean=0.0,
-                std=self.config.initializer_range,
-            ).to(module.position_embeddings.dtype)
-
+            init.trunc_normal_(module.position_embeddings, mean=0.0, std=self.config.initializer_range)
         elif isinstance(module, VitDetAttention) and self.config.use_relative_position_embeddings:
-            module.rel_pos_h.data = nn.init.trunc_normal_(
-                module.rel_pos_h.data.to(torch.float32),
-                mean=0.0,
-                std=self.config.initializer_range,
-            )
-            module.rel_pos_w.data = nn.init.trunc_normal_(
-                module.rel_pos_w.data.to(torch.float32),
-                mean=0.0,
-                std=self.config.initializer_range,
-            )
-
+            init.trunc_normal_(module.rel_pos_h, mean=0.0, std=self.config.initializer_range)
+            init.trunc_normal_(module.rel_pos_w, mean=0.0, std=self.config.initializer_range)
         elif isinstance(module, VitDetResBottleneckBlock):
             for layer in [module.conv1, module.conv2, module.conv3]:
-                caffe2_msra_fill(layer)
+                init.kaiming_normal_(layer.weight, mode="fan_out", nonlinearity="relu")
+                if layer.bias is not None:
+                    init.constant_(layer.bias, 0)
             for layer in [module.norm1, module.norm2]:
-                layer.weight.data.fill_(1.0)
-                layer.bias.data.zero_()
+                init.ones_(layer.weight)
+                init.zeros_(layer.bias)
             # zero init last norm layer.
-            module.norm3.weight.data.zero_()
-            module.norm3.bias.data.zero_()
+            init.zeros_(module.norm3.weight)
+            init.zeros_(module.norm3.bias)
 
 
 @auto_docstring
@@ -655,11 +619,12 @@ class VitDetModel(VitDetPreTrainedModel):
     @auto_docstring
     def forward(
         self,
-        pixel_values: Optional[torch.Tensor] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-    ) -> Union[tuple, BaseModelOutput]:
+        pixel_values: torch.Tensor | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        return_dict: bool | None = None,
+        **kwargs,
+    ) -> tuple | BaseModelOutput:
         r"""
         Examples:
 
@@ -683,7 +648,7 @@ class VitDetModel(VitDetPreTrainedModel):
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        return_dict = return_dict if return_dict is not None else self.config.return_dict
 
         if pixel_values is None:
             raise ValueError("You have to specify pixel_values")
@@ -713,10 +678,9 @@ class VitDetModel(VitDetPreTrainedModel):
     ViTDet backbone, to be used with frameworks like Mask R-CNN.
     """
 )
-class VitDetBackbone(VitDetPreTrainedModel, BackboneMixin):
+class VitDetBackbone(BackboneMixin, VitDetPreTrainedModel):
     def __init__(self, config):
         super().__init__(config)
-        super()._init_backbone(config)
 
         self.embeddings = VitDetEmbeddings(config)
         self.encoder = VitDetEncoder(config)
@@ -728,13 +692,16 @@ class VitDetBackbone(VitDetPreTrainedModel, BackboneMixin):
     def get_input_embeddings(self) -> VitDetEmbeddings:
         return self.embeddings.projection
 
+    @can_return_tuple
+    @filter_output_hidden_states
     @auto_docstring
     def forward(
         self,
         pixel_values: torch.Tensor,
-        output_hidden_states: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
+        output_hidden_states: bool | None = None,
+        output_attentions: bool | None = None,
+        return_dict: bool | None = None,
+        **kwargs,
     ) -> BackboneOutput:
         r"""
         Examples:
@@ -755,7 +722,7 @@ class VitDetBackbone(VitDetPreTrainedModel, BackboneMixin):
         >>> list(feature_maps[-1].shape)
         [1, 768, 14, 14]
         ```"""
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        return_dict = return_dict if return_dict is not None else self.config.return_dict
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )

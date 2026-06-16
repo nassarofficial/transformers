@@ -55,15 +55,17 @@ hf auth login
 </hfoption>
 </hfoptions>
 
-Install Pytorch.
+Install PyTorch.
 
 ```bash
+# remove ! if installing from the CLI
 !pip install torch
 ```
 
 Then install an up-to-date version of Transformers and some additional libraries from the Hugging Face ecosystem for accessing datasets and vision models, evaluating training, and optimizing training for large models.
 
 ```bash
+# remove ! if installing from the CLI
 !pip install -U transformers datasets evaluate accelerate timm
 ```
 
@@ -252,7 +254,7 @@ trainer = Trainer(
     args=training_args,
     train_dataset=dataset["train"],
     eval_dataset=dataset["test"],
-    tokenizer=tokenizer,
+    processing_class=tokenizer,
     data_collator=data_collator,
 )
 

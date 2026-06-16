@@ -136,11 +136,10 @@ tokenizer = LlamaTokenizer.from_pretrained("meta-llama/Llama-2-7b-hf", pad_token
 model = LlamaForCausalLM.from_pretrained("meta-llama/Llama-2-7b-hf", device_map="sequential")
 inputs = tokenizer(prompts, return_tensors="pt", padding=True).to(model.device)
 
-def decode_one_tokens(model, cur_token, input_pos, cache_position, past_key_values):
+def decode_one_tokens(model, cur_token, input_pos, past_key_values):
     logits = model(
         cur_token,
         position_ids=input_pos,
-        cache_position=cache_position,
         past_key_values=past_key_values,
         return_dict=False,
         use_cache=True
@@ -160,25 +159,25 @@ with torch.no_grad():
     past_key_values = StaticCache(
         config=model.config, max_cache_len=4096
     )
-    cache_position = torch.arange(seq_length, device=torch_device)
+    positions = torch.arange(seq_length, device=torch_device)
     generated_ids = torch.zeros(
         batch_size, seq_length + NUM_TOKENS_TO_GENERATE + 1, dtype=torch.int, device=torch_device
     )
-    generated_ids[:, cache_position] = inputs["input_ids"].to(torch_device).to(torch.int)
+    generated_ids[:, positions] = inputs["input_ids"].to(torch_device).to(torch.int)
 
     logits = model(
-        **inputs, cache_position=cache_position, past_key_values=past_key_values,return_dict=False, use_cache=True
+        **inputs, past_key_values=past_key_values,return_dict=False, use_cache=True
     )[0]
     next_token = torch.argmax(logits[:, -1], dim=-1)[:, None]
     generated_ids[:, seq_length] = next_token[:, 0]
 
     decode_one_tokens = torch.compile(decode_one_tokens, mode="reduce-overhead", fullgraph=True)
-    cache_position = torch.tensor([seq_length + 1], device=torch_device)
+    positions = torch.tensor([seq_length + 1], device=torch_device)
     for _ in range(1, NUM_TOKENS_TO_GENERATE):
         with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True):
-            next_token = decode_one_tokens(model, next_token.clone(), None, cache_position, past_key_values)
-            generated_ids[:, cache_position] = next_token.int()
-        cache_position += 1
+            next_token = decode_one_tokens(model, next_token.clone(), None, past_key_values)
+            generated_ids[:, positions] = next_token.int()
+        positions += 1
 
 text = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
 text
@@ -372,7 +371,7 @@ with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=False, enable
 양자화는 LLM 가중치를 더 낮은 정밀도로 저장하여 크기를 줄입니다. 이는 메모리 사용량을 줄이며 GPU 메모리에 제약이 있는 경우 추론을 위해 LLM을 로드하는 것을 더 용이하게 합니다. GPU가 충분하다면, 모델을 양자화할 필요는 없습니다. 추가적인 양자화 및 양자화 해제 단계로 인해 약간의 지연이 발생할 수 있기 때문입니다(AWQ 및 융합 AWQ 모듈 제외).
 
 > [!TIP]
-> 다양한 양자화 라이브러리(자세한 내용은 [Quantization](./quantization) 가이드를 참조하십시오)가 있습니다. 여기에는 Quanto, AQLM, VPTQ, AWQ 및 AutoGPTQ가 포함됩니다. 사용 사례에 가장 잘 맞는 라이브러리를 사용해 보십시오. 또한 AutoGPTQ와 bitsandbytes를 비교하는 [Overview of natively supported quantization schemes in 🤗 Transformers](https://hf.co/blog/overview-quantization-transformers) 블로그 게시물을 읽어보는 것을 추천합니다.
+> 다양한 양자화 라이브러리(자세한 내용은 [Quantization](./quantization) 가이드를 참조하십시오)가 있습니다. 여기에는 Quanto, AQLM, VPTQ, AWQ 및 GPT-QModel이 포함됩니다. 사용 사례에 가장 잘 맞는 라이브러리를 사용해 보십시오. 또한 gptqmodel과 bitsandbytes를 비교하는 [Overview of natively supported quantization schemes in 🤗 Transformers](https://hf.co/blog/overview-quantization-transformers) 블로그 게시물을 읽어보는 것을 추천합니다.
 
 아래의 모델 메모리 계산기를 사용하여 모델을 로드하는 데 필요한 메모리를 추정하고 비교해 보십시오. 예를 들어 [Mistral-7B-v0.1](https://huggingface.co/mistralai/Mistral-7B-v0.1)를 로드하는 데 필요한 메모리를 추정해 보십시오.
 

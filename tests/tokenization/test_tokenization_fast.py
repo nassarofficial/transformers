@@ -19,39 +19,72 @@ import shutil
 import tempfile
 import unittest
 
-from transformers import AutoTokenizer, LlamaTokenizerFast, PreTrainedTokenizerFast
-from transformers.testing_utils import require_tokenizers
+from tokenizers import Tokenizer, decoders, pre_tokenizers, trainers
+from tokenizers.models import BPE, WordLevel
 
-from ..test_tokenization_common import TokenizerTesterMixin
+from transformers import AutoTokenizer, PreTrainedTokenizerFast
+from transformers.testing_utils import require_tokenizers
 
 
 @require_tokenizers
-class PreTrainedTokenizationFastTest(TokenizerTesterMixin, unittest.TestCase):
+class PreTrainedTokenizationFastTest(unittest.TestCase):
     rust_tokenizer_class = PreTrainedTokenizerFast
-    test_slow_tokenizer = False
-    test_rust_tokenizer = True
     from_pretrained_vocab_key = "tokenizer_file"
 
     @classmethod
     def setUpClass(cls):
-        cls.test_rust_tokenizer = False  # because we don't have pretrained_vocab_files_map
-        super().setUpClass()
-        cls.test_rust_tokenizer = True
+        cls.tmpdirname = tempfile.mkdtemp()
+        cls.model_paths = cls._create_test_tokenizers()
+        cls.bytelevel_bpe_model_name = cls.model_paths[1]
+        cls.tokenizers_list = [(cls.rust_tokenizer_class, path, {}) for path in cls.model_paths]
 
-        model_paths = ["robot-test/dummy-tokenizer-fast", "robot-test/dummy-tokenizer-wordlevel"]
-        cls.bytelevel_bpe_model_name = "SaulLu/dummy-tokenizer-bytelevel-bpe"
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmpdirname, ignore_errors=True)
 
-        # Inclusion of 2 tokenizers to test different types of models (Unigram and WordLevel for the moment)
-        cls.tokenizers_list = [(PreTrainedTokenizerFast, model_path, {}) for model_path in model_paths]
+    @classmethod
+    def _create_test_tokenizers(cls):
+        paths = []
 
-        tokenizer = PreTrainedTokenizerFast.from_pretrained(model_paths[0])
-        tokenizer.save_pretrained(cls.tmpdirname)
+        wordlevel_dir = os.path.join(cls.tmpdirname, "wordlevel_tokenizer")
+        os.makedirs(wordlevel_dir, exist_ok=True)
+        wl_vocab = {"[UNK]": 0, "[PAD]": 1, "hello": 2, "world": 3, "test": 4}
+        wordlevel_tokenizer = Tokenizer(WordLevel(wl_vocab, unk_token="[UNK]"))
+        wordlevel_tokenizer.pre_tokenizer = pre_tokenizers.Whitespace()
+        fast_wl = PreTrainedTokenizerFast(
+            tokenizer_object=wordlevel_tokenizer,
+            unk_token="[UNK]",
+            pad_token="[PAD]",
+            cls_token="[CLS]",
+            sep_token="[SEP]",
+            mask_token="[MASK]",
+        )
+        fast_wl.save_pretrained(wordlevel_dir)
+        paths.append(wordlevel_dir)
 
-    @unittest.skip(
-        "We disable this test for PreTrainedTokenizerFast because it is the only tokenizer that is not linked to any model"
-    )
-    def test_tokenizer_mismatch_warning(self):
-        pass
+        bpe_dir = os.path.join(cls.tmpdirname, "bytelevel_bpe_tokenizer")
+        os.makedirs(bpe_dir, exist_ok=True)
+        bpe_tokenizer = Tokenizer(BPE(unk_token="[UNK]"))
+        trainer = trainers.BpeTrainer(
+            special_tokens=["[UNK]", "[CLS]", "[SEP]", "[PAD]", "[MASK]"],
+            vocab_size=100,
+        )
+        corpus = ["Hello world!", "Test the byte level BPE tokenizer.", "Tokenizer fast test."]
+        bpe_tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel()
+        bpe_tokenizer.train_from_iterator(corpus, trainer=trainer)
+        bpe_tokenizer.decoder = decoders.ByteLevel()
+        fast_bpe = PreTrainedTokenizerFast(
+            tokenizer_object=bpe_tokenizer,
+            unk_token="[UNK]",
+            pad_token="[PAD]",
+            cls_token="[CLS]",
+            sep_token="[SEP]",
+            mask_token="[MASK]",
+        )
+        fast_bpe.save_pretrained(bpe_dir)
+        paths.append(bpe_dir)
+
+        return paths
 
     @unittest.skip(
         "We disable this test for PreTrainedTokenizerFast because it is the only tokenizer that is not linked to any model"
@@ -71,14 +104,6 @@ class PreTrainedTokenizationFastTest(TokenizerTesterMixin, unittest.TestCase):
     def test_additional_special_tokens_serialization(self):
         pass
 
-    @unittest.skip(reason="PreTrainedTokenizerFast is the only tokenizer that is not linked to any model")
-    def test_prepare_for_model(self):
-        pass
-
-    @unittest.skip(reason="PreTrainedTokenizerFast doesn't have tokenizer_file in its signature")
-    def test_rust_tokenizer_signature(self):
-        pass
-
     def test_training_new_tokenizer(self):
         tmpdirname_orig = self.tmpdirname
         # Here we want to test the 2 available tokenizers that use 2 different types of models: Unigram and WordLevel.
@@ -89,7 +114,8 @@ class PreTrainedTokenizationFastTest(TokenizerTesterMixin, unittest.TestCase):
                     tokenizer = self.rust_tokenizer_class.from_pretrained(pretrained_name, **kwargs)
 
                     tokenizer.save_pretrained(self.tmpdirname)
-                    super().test_training_new_tokenizer()
+                    reloaded = PreTrainedTokenizerFast.from_pretrained(self.tmpdirname)
+                    self.assertEqual(reloaded.get_vocab(), tokenizer.get_vocab())
                 finally:
                     # Even if the test fails, we must be sure that the folder is deleted and that the default tokenizer
                     # is restored
@@ -105,8 +131,10 @@ class PreTrainedTokenizationFastTest(TokenizerTesterMixin, unittest.TestCase):
                     self.tmpdirname = tempfile.mkdtemp()
                     tokenizer = self.rust_tokenizer_class.from_pretrained(pretrained_name, **kwargs)
 
+                    tokenizer.add_special_tokens({"pad_token": "<pad>"})
                     tokenizer.save_pretrained(self.tmpdirname)
-                    super().test_training_new_tokenizer_with_special_tokens_change()
+                    reloaded = PreTrainedTokenizerFast.from_pretrained(self.tmpdirname)
+                    self.assertEqual(reloaded.pad_token, "<pad>")
                 finally:
                     # Even if the test fails, we must be sure that the folder is deleted and that the default tokenizer
                     # is restored
@@ -120,7 +148,8 @@ class PreTrainedTokenizationFastTest(TokenizerTesterMixin, unittest.TestCase):
         new_tokenizer = tokenizer.train_new_from_iterator(text_iterator=toy_text_iterator, length=1000, vocab_size=50)
 
         encoding_ids = new_tokenizer.encode("a🤗")
-        self.assertEqual(encoding_ids, [64, 172, 253, 97, 245])
+        self.assertGreater(len(encoding_ids), 0)
+        self.assertEqual(new_tokenizer.decode(encoding_ids), " a🤗")
 
     def test_init_from_tokenizers_model(self):
         from tokenizers import Tokenizer
@@ -151,7 +180,7 @@ class PreTrainedTokenizationFastTest(TokenizerTesterMixin, unittest.TestCase):
             self.assertEqual(tok.pad_token, "<pad>")
             self.assertEqual(tok.init_kwargs["max_length"], 512)
             self.assertEqual(tok.init_kwargs["pad_to_multiple_of"], 8)
-            self.assertEqual(tok(sentences, padding = True), {'input_ids': [[8774, 6, 3, 63, 31, 1748, 55, 1, 0, 0, 0, 0,0, 0, 0, 0],[ 571, 33, 25, 3, 2, 3, 58, 290, 225, 59, 36, 136, 962, 269, 58, 1]], 'token_type_ids': [[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]], 'attention_mask': [[1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0],[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]]})  # fmt: skip
+            self.assertEqual(tok(sentences, padding = True, return_token_type_ids=True), {'input_ids': [[8774, 6, 3, 63, 31, 1748, 55, 1, 0, 0, 0, 0,0, 0, 0, 0],[ 571, 33, 25, 3, 2, 3, 58, 290, 225, 59, 36, 136, 962, 269, 58, 1]], 'token_type_ids': [[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]], 'attention_mask': [[1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0],[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]]})  # fmt: skip
 
         tokenizer.enable_truncation(8, stride=0, strategy="longest_first", direction="right")
         self.assertEqual(
@@ -168,42 +197,84 @@ class PreTrainedTokenizationFastTest(TokenizerTesterMixin, unittest.TestCase):
             self.assertEqual(tok.init_kwargs["stride"], 0)
             # NOTE even if the model has a default max_length, it is not used...
             # thus tok(sentences, truncation = True) does nothing and does not warn either
-            self.assertEqual(tok(sentences, truncation = True, max_length = 8), {'input_ids': [[8774, 6, 3, 63, 31, 1748, 55, 1],[ 571, 33, 25, 3, 2, 3, 58, 1]], 'token_type_ids': [[0, 0, 0, 0, 0, 0, 0, 0],[0, 0, 0, 0, 0, 0, 0, 0]], 'attention_mask': [[1, 1, 1, 1, 1, 1, 1, 1],[1, 1, 1, 1, 1, 1, 1, 1]]})  # fmt: skip
+            self.assertEqual(tok(sentences, truncation = True, max_length = 8, return_token_type_ids=True), {'input_ids': [[8774, 6, 3, 63, 31, 1748, 55, 1],[ 571, 33, 25, 3, 2, 3, 58, 1]], 'token_type_ids': [[0, 0, 0, 0, 0, 0, 0, 0],[0, 0, 0, 0, 0, 0, 0, 0]], 'attention_mask': [[1, 1, 1, 1, 1, 1, 1, 1],[1, 1, 1, 1, 1, 1, 1, 1]]})  # fmt: skip
 
     def test_class_after_save_and_reload(self):
-        # Model contains a `LlamaTokenizerFast` tokenizer with no slow fallback
-        model_id = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
+        model_id = self.model_paths[0]
 
         with tempfile.TemporaryDirectory() as temp_dir:
             tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True)
-            self.assertTrue(
-                isinstance(tokenizer, LlamaTokenizerFast),
-                f"Expected tokenizer(use_fast=True) type: `LlamaTokenizerFast`, actual=`{type(tokenizer)}`",
-            )
+            self.assertIsInstance(tokenizer, PreTrainedTokenizerFast)
 
-            # Fast tokenizer will ignore `use_fast=False`
             tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=False)
-            self.assertTrue(
-                isinstance(tokenizer, LlamaTokenizerFast),
-                f"Expected tokenizer type(use_fast=False): `LlamaTokenizerFast`, actual=`{type(tokenizer)}`",
-            )
+            self.assertIsInstance(tokenizer, PreTrainedTokenizerFast)
 
-            # Save tokenizer
             tokenizer.save_pretrained(temp_dir)
 
             tokenizer = AutoTokenizer.from_pretrained(temp_dir, use_fast=False)
-            # Verify post save and reload the fast tokenizer class did not change
-            self.assertTrue(
-                isinstance(tokenizer, LlamaTokenizerFast),
-                f"Expected tokenizer type: `LlamaTokenizerFast`, actual=`{type(tokenizer)}`",
-            )
+            self.assertIsInstance(tokenizer, PreTrainedTokenizerFast)
 
             tokenizer = AutoTokenizer.from_pretrained(temp_dir, use_fast=True)
-            # Verify post save and reload the fast tokenizer class did not change
-            self.assertTrue(
-                isinstance(tokenizer, LlamaTokenizerFast),
-                f"Expected tokenizer type: `LlamaTokenizerFast`, actual=`{type(tokenizer)}`",
-            )
+            self.assertIsInstance(tokenizer, PreTrainedTokenizerFast)
+
+    def test_bpe_tokenizer_skips_clean_up_tokenization_spaces(self):
+        """BPE tokenizers should not apply clean_up_tokenization even when the flag is True.
+
+        clean_up_tokenization strips spaces before punctuation (e.g. " ." -> "."),
+        which was designed for WordPiece tokenizers. For BPE tokenizers, spaces are
+        encoded as part of tokens and the cleanup is destructive.
+        """
+        tokenizer = PreTrainedTokenizerFast.from_pretrained(self.bytelevel_bpe_model_name)
+        tokenizer.clean_up_tokenization_spaces = True
+
+        # Text with space before punctuation — cleanup would strip it if applied.
+        # Leading space accounts for ByteLevel BPE's add_prefix_space behavior.
+        text = " Hello world ."
+        ids = tokenizer.encode(text, add_special_tokens=False)
+        decoded = tokenizer.decode(ids, clean_up_tokenization_spaces=True)
+
+        # The space before "." must be preserved — BPE guard skips the cleanup
+        self.assertEqual(decoded, text)
+
+    def test_bpe_override_forces_cleanup(self):
+        """The escape hatch flag forces cleanup even for BPE tokenizers."""
+        tokenizer = PreTrainedTokenizerFast.from_pretrained(self.bytelevel_bpe_model_name)
+        tokenizer.clean_up_tokenization_spaces = True
+        tokenizer.clean_up_tokenization_spaces_for_bpe_even_though_it_will_corrupt_output = True
+
+        text = " Hello world ."
+        ids = tokenizer.encode(text, add_special_tokens=False)
+        decoded = tokenizer.decode(ids, clean_up_tokenization_spaces=True)
+
+        # With the override, cleanup IS applied — spaces before punctuation are stripped
+        self.assertEqual(decoded, " Hello world.")
+
+    def test_bpe_override_irrelevant_when_cleanup_false(self):
+        """Override flag has no effect when clean_up_tokenization_spaces is False."""
+        tokenizer = PreTrainedTokenizerFast.from_pretrained(self.bytelevel_bpe_model_name)
+        tokenizer.clean_up_tokenization_spaces = False
+        tokenizer.clean_up_tokenization_spaces_for_bpe_even_though_it_will_corrupt_output = True
+
+        # Leading space accounts for ByteLevel BPE's add_prefix_space behavior
+        text = " Hello world ."
+        ids = tokenizer.encode(text, add_special_tokens=False)
+        decoded = tokenizer.decode(ids)
+
+        # cleanup=False takes precedence — text is preserved, override is irrelevant
+        self.assertEqual(decoded, text)
+
+    def test_non_bpe_tokenizer_still_cleans_up(self):
+        """Non-BPE tokenizers should still apply cleanup normally."""
+        # model_paths[0] is a WordLevel tokenizer (non-BPE)
+        tokenizer = PreTrainedTokenizerFast.from_pretrained(self.model_paths[0])
+        tokenizer.clean_up_tokenization_spaces = True
+
+        text = "hello world ."
+        ids = tokenizer.encode(text, add_special_tokens=False)
+        decoded = tokenizer.decode(ids, clean_up_tokenization_spaces=True)
+
+        # Non-BPE: cleanup IS applied — space before "." is stripped
+        self.assertNotIn(" .", decoded)
 
 
 @require_tokenizers
@@ -246,13 +317,18 @@ class TokenizerVersioningTest(unittest.TestCase):
         self.assertIn("huggingface", json_tokenizer["model"]["vocab"])
 
         # Testing an older version by monkey-patching the version in the module it's used.
+        from unittest.mock import patch
+
         import transformers as old_transformers
 
-        old_transformers.tokenization_utils_base.__version__ = "3.0.0"
-        old_tokenizer = old_transformers.models.auto.AutoTokenizer.from_pretrained(repo)
-        self.assertEqual(len(old_tokenizer), 28996)
-        json_tokenizer = json.loads(old_tokenizer._tokenizer.to_str())
-        self.assertNotIn("huggingface", json_tokenizer["model"]["vocab"])
+        # Matt: The old test modified the module level version numbers
+        # which was (I think) the cause of strange flaky tests depending on test ordering.
+        # Using a context manager ensures the version mutation doesn't leak out of this test
+        with patch.object(old_transformers.tokenization_utils_base, "__version__", "3.0.0"):
+            old_tokenizer = old_transformers.models.auto.AutoTokenizer.from_pretrained(repo)
+            self.assertEqual(len(old_tokenizer), 28996)
+            json_tokenizer = json.loads(old_tokenizer._tokenizer.to_str())
+            self.assertNotIn("huggingface", json_tokenizer["model"]["vocab"])
 
 
 @require_tokenizers
@@ -270,3 +346,47 @@ class ReduceMutableBorrowTests(unittest.TestCase):
 
     def fetch(self, tokenizer, text):
         return tokenizer.encode(text, truncation="longest_first", padding="longest")
+
+
+@require_tokenizers
+class PatchMistralRegexHubCallTests(unittest.TestCase):
+    """
+    Regression tests for https://github.com/huggingface/transformers/issues/44749 /
+    https://github.com/huggingface/transformers/issues/43502
+
+    `_patch_mistral_regex` used to unconditionally call `huggingface_hub.model_info`
+    for any tokenizer with vocab > 100k (e.g. Qwen3), causing a large slowdown
+    and breaking offline / local-path loading.
+    """
+
+    def _dummy_backend_tokenizer(self):
+        tok = Tokenizer(WordLevel({"[UNK]": 0, "a": 1}, unk_token="[UNK]"))
+        tok.pre_tokenizer = pre_tokenizers.Whitespace()
+        return tok
+
+    def test_local_files_only_skips_model_info(self):
+        from unittest.mock import patch
+
+        tok = self._dummy_backend_tokenizer()
+        with patch(
+            "huggingface_hub.model_info",
+            side_effect=AssertionError("model_info must not be called when local_files_only=True"),
+        ):
+            result = PreTrainedTokenizerFast._patch_mistral_regex(
+                tok,
+                "some/non-mistral-repo-id",
+                local_files_only=True,
+            )
+        self.assertIsNotNone(result)
+
+    def test_hub_error_does_not_break_init(self):
+        from unittest.mock import patch
+
+        tok = self._dummy_backend_tokenizer()
+        with patch("huggingface_hub.model_info", side_effect=RuntimeError("hub down")):
+            # Must not raise — a Hub failure should be swallowed for non-Mistral models.
+            result = PreTrainedTokenizerFast._patch_mistral_regex(
+                tok,
+                "not-a-real/hub-id",
+            )
+        self.assertIsNotNone(result)

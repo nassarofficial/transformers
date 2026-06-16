@@ -1,4 +1,3 @@
-# coding=utf-8
 # Copyright 2024 The HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,11 +13,11 @@
 # limitations under the License.
 
 from dataclasses import dataclass
-from typing import Optional, Union
 
 import torch
 from torch import Tensor, nn
 
+from ... import initialization as init
 from ...modeling_outputs import ImageClassifierOutput, ModelOutput
 from ...modeling_utils import PreTrainedModel
 from ...utils import auto_docstring, is_timm_available, requires_backends
@@ -29,13 +28,13 @@ if is_timm_available():
     import timm
 
 
-@dataclass
 @auto_docstring(
     custom_intro="""
     Output class for models TimmWrapperModel, containing the last hidden states, an optional pooled output,
     and optional hidden states.
     """
 )
+@dataclass
 class TimmWrapperModelOutput(ModelOutput):
     r"""
     last_hidden_state (`torch.FloatTensor`):
@@ -50,9 +49,9 @@ class TimmWrapperModelOutput(ModelOutput):
     """
 
     last_hidden_state: torch.FloatTensor
-    pooler_output: Optional[torch.FloatTensor] = None
-    hidden_states: Optional[tuple[torch.FloatTensor, ...]] = None
-    attentions: Optional[tuple[torch.FloatTensor, ...]] = None
+    pooler_output: torch.FloatTensor | None = None
+    hidden_states: tuple[torch.FloatTensor, ...] | None = None
+    attentions: tuple[torch.FloatTensor, ...] | None = None
 
 
 def _create_timm_model_with_error_handling(config: "TimmWrapperConfig", **model_kwargs):
@@ -79,59 +78,61 @@ def _create_timm_model_with_error_handling(config: "TimmWrapperConfig", **model_
 
 @auto_docstring
 class TimmWrapperPreTrainedModel(PreTrainedModel):
+    base_model_prefix = "timm_model"
     main_input_name = "pixel_values"
-    input_modalities = "image"
+    input_modalities = ("image",)
     config: TimmWrapperConfig
-    _no_split_modules = []
+    # add WA here as `timm` does not support model parallelism
+    _no_split_modules = ["TimmWrapperModel"]
     model_tags = ["timm"]
 
     # used in Trainer to avoid passing `loss_kwargs` to model forward
     accepts_loss_kwargs = False
 
-    def __init__(self, *args, **kwargs):
-        requires_backends(self, ["vision", "timm"])
-        super().__init__(*args, **kwargs)
-
     def post_init(self):
         self.supports_gradient_checkpointing = self._timm_model_supports_gradient_checkpointing()
         super().post_init()
-
-    @staticmethod
-    def _fix_state_dict_key_on_load(key) -> tuple[str, bool]:
-        """
-        Overrides original method that renames `gamma` and `beta` to `weight` and `bias`.
-        We don't want this behavior for timm wrapped models. Instead, this method adds a
-        "timm_model." prefix to enable loading official timm Hub checkpoints.
-        """
-        if "timm_model." not in key:
-            return f"timm_model.{key}", True
-        return key, False
-
-    def _fix_state_dict_key_on_save(self, key):
-        """
-        Overrides original method to remove "timm_model." prefix from state_dict keys.
-        Makes the saved checkpoint compatible with the `timm` library.
-        """
-        return key.replace("timm_model.", ""), True
 
     def load_state_dict(self, state_dict, *args, **kwargs):
         """
         Override original method to fix state_dict keys on load for cases when weights are loaded
         without using the `from_pretrained` method (e.g., in Trainer to resume from checkpoint).
         """
-        state_dict = {self._fix_state_dict_key_on_load(k)[0]: v for k, v in state_dict.items()}
+        state_dict = {f"timm_model.{k}" if "timm_model." not in k else k: v for k, v in state_dict.items()}
         return super().load_state_dict(state_dict, *args, **kwargs)
 
+    @torch.no_grad()
     def _init_weights(self, module):
         """
         Initialize weights function to properly initialize Linear layer weights.
         Since model architectures may vary, we assume only the classifier requires
         initialization, while all other weights should be loaded from the checkpoint.
         """
-        if isinstance(module, (nn.Linear)):
-            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
+        if isinstance(module, nn.Linear):
+            init.normal_(module.weight, mean=0.0, std=self.config.initializer_range)
             if module.bias is not None:
-                module.bias.data.zero_()
+                init.zeros_(module.bias)
+        # Also, reinit all non-persistent buffers if any!
+        if hasattr(module, "init_non_persistent_buffers"):
+            module.init_non_persistent_buffers()
+        elif (
+            hasattr(module, "_get_pos_embed_values")
+            and hasattr(module, "feat_shape")
+            and module.feat_shape is not None
+        ):
+            module.pos_embed = module._get_pos_embed_values(
+                feat_shape=module.feat_shape,
+                device=module.pos_embed.device if module.pos_embed is not None else None,
+                dtype=module.pos_embed.dtype if module.pos_embed is not None else torch.float32,
+            )
+        elif isinstance(module, nn.BatchNorm2d):
+            # TimmWrapper always creates models with pretrained=False, so buffers are never pre-loaded
+            # Always initialize buffers (handles both meta device and to_empty() cases)
+            running_mean = getattr(module, "running_mean", None)
+            if running_mean is not None:
+                init.zeros_(module.running_mean)
+                init.ones_(module.running_var)
+                init.zeros_(module.num_batches_tracked)
 
     def _timm_model_supports_gradient_checkpointing(self):
         """
@@ -151,6 +152,13 @@ class TimmWrapperPreTrainedModel(PreTrainedModel):
     def _set_gradient_checkpointing(self, enable: bool = True, *args, **kwargs):
         self.timm_model.set_grad_checkpointing(enable)
 
+    def get_input_embeddings(self):
+        # TIMM backbones operate directly on images and do not expose token embeddings.
+        return None
+
+    def set_input_embeddings(self, value):
+        raise NotImplementedError("TimmWrapper models do not own token embeddings and cannot set them.")
+
 
 class TimmWrapperModel(TimmWrapperPreTrainedModel):
     """
@@ -158,6 +166,7 @@ class TimmWrapperModel(TimmWrapperPreTrainedModel):
     """
 
     def __init__(self, config: TimmWrapperConfig):
+        requires_backends(self, ["vision", "timm"])
         super().__init__(config)
         # using num_classes=0 to avoid creating classification head
         extra_init_kwargs = config.model_args or {}
@@ -169,12 +178,13 @@ class TimmWrapperModel(TimmWrapperPreTrainedModel):
     def forward(
         self,
         pixel_values: torch.FloatTensor,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[Union[bool, list[int]]] = None,
-        return_dict: Optional[bool] = None,
-        do_pooling: Optional[bool] = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | list[int] | None = None,
+        return_dict: bool | None = None,
+        do_pooling: bool | None = None,
+        use_cache: bool | None = None,
         **kwargs,
-    ) -> Union[TimmWrapperModelOutput, tuple[Tensor, ...]]:
+    ) -> TimmWrapperModelOutput | tuple[Tensor, ...]:
         r"""
         output_attentions (`bool`, *optional*):
             Whether or not to return the attentions tensors of all attention layers. Not compatible with timm wrapped models.
@@ -215,7 +225,7 @@ class TimmWrapperModel(TimmWrapperPreTrainedModel):
         >>> last_hidden_state = outputs.last_hidden_state
         ```
         """
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        return_dict = return_dict if return_dict is not None else self.config.return_dict
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
@@ -273,6 +283,7 @@ class TimmWrapperForImageClassification(TimmWrapperPreTrainedModel):
     """
 
     def __init__(self, config: TimmWrapperConfig):
+        requires_backends(self, ["vision", "timm"])
         super().__init__(config)
 
         if config.num_labels == 0:
@@ -293,12 +304,12 @@ class TimmWrapperForImageClassification(TimmWrapperPreTrainedModel):
     def forward(
         self,
         pixel_values: torch.FloatTensor,
-        labels: Optional[torch.LongTensor] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[Union[bool, list[int]]] = None,
-        return_dict: Optional[bool] = None,
+        labels: torch.LongTensor | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | list[int] | None = None,
+        return_dict: bool | None = None,
         **kwargs,
-    ) -> Union[ImageClassifierOutput, tuple[Tensor, ...]]:
+    ) -> ImageClassifierOutput | tuple[Tensor, ...]:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
             Labels for computing the image classification/regression loss. Indices should be in `[0, ...,
@@ -341,7 +352,7 @@ class TimmWrapperForImageClassification(TimmWrapperPreTrainedModel):
         >>> top5_probabilities, top5_class_indices = torch.topk(logits.softmax(dim=1) * 100, k=5)
         ```
         """
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        return_dict = return_dict if return_dict is not None else self.config.return_dict
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )

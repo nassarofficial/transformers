@@ -13,13 +13,10 @@ specific language governing permissions and limitations under the License.
 rendered properly in your Markdown viewer.
 
 -->
-*This model was released on 2021-12-20 and added to Hugging Face Transformers on 2022-01-28.*
+*This model was published in HF papers on 2021-12-20 and contributed to Hugging Face Transformers on 2022-01-28.*
 
 # XGLM
 
-<div class="flex flex-wrap space-x-1">
-<img alt="PyTorch" src="https://img.shields.io/badge/PyTorch-DE3412?style=flat&logo=pytorch&logoColor=white">
-</div>
 
 ## Overview
 
@@ -57,9 +54,7 @@ This model was contributed by [Suraj](https://huggingface.co/valhalla). The orig
 ## XGLMTokenizer
 
 [[autodoc]] XGLMTokenizer
-    - build_inputs_with_special_tokens
     - get_special_tokens_mask
-    - create_token_type_ids_from_sequences
     - save_vocabulary
 
 ## XGLMTokenizerFast

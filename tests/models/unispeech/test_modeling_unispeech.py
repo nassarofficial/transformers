@@ -316,7 +316,7 @@ class UniSpeechRobustModelTest(ModelTesterMixin, PipelineTesterMixin, unittest.T
         self.model_tester = UniSpeechModelTester(
             self, conv_stride=(3, 3, 3), feat_extract_norm="layer", do_stable_layer_norm=True
         )
-        self.config_tester = ConfigTester(self, config_class=UniSpeechConfig, hidden_size=37)
+        self.config_tester = ConfigTester(self, config_class=UniSpeechConfig, hidden_size=32)
 
     def test_config(self):
         self.config_tester.run_common_tests()
@@ -421,13 +421,13 @@ class UniSpeechRobustModelTest(ModelTesterMixin, PipelineTesterMixin, unittest.T
     # overwrite from test_modeling_common
     def _mock_init_weights(self, module):
         if hasattr(module, "weight") and module.weight is not None:
-            module.weight.data.fill_(3)
+            module.weight.fill_(3)
         if hasattr(module, "weight_g") and module.weight_g is not None:
             module.weight_g.data.fill_(3)
         if hasattr(module, "weight_v") and module.weight_v is not None:
             module.weight_v.data.fill_(3)
         if hasattr(module, "bias") and module.bias is not None:
-            module.bias.data.fill_(3)
+            module.bias.fill_(3)
         if hasattr(module, "codevectors") and module.codevectors is not None:
             module.codevectors.data.fill_(3)
         if hasattr(module, "masked_spec_embed") and module.masked_spec_embed is not None:

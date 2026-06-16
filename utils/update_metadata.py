@@ -1,4 +1,3 @@
-# coding=utf-8
 # Copyright 2021 The HuggingFace Inc. team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,7 +21,7 @@ python utils/update_metadata.py --token <token> --commit_sha <commit_sha>
 ```
 
 Usage to check all pipelines are properly defined in the constant `PIPELINE_TAGS_AND_AUTO_MODELS` of this script, so
-that new pipelines are properly added as metadata (as used in `make repo-consistency`):
+that new pipelines are properly added as metadata (as used in `make check-repo`):
 
 ```bash
 python utils/update_metadata.py --check-only
@@ -39,8 +38,22 @@ import pandas as pd
 from datasets import Dataset
 from huggingface_hub import hf_hub_download, upload_folder
 
+from transformers.models.auto.modeling_auto import MODEL_FOR_MULTIMODAL_LM_MAPPING_NAMES
 from transformers.utils import direct_transformers_import
 
+
+CHECKER_CONFIG = {
+    "name": "update_metadata",
+    "label": "Model metadata",
+    # Approximate: imports the transformers module and inspects pipeline/auto mappings
+    # at runtime. Does not iterate over files matching these globs directly.
+    "cache_globs": ["src/transformers/models/**/*.py", "docs/**/*.md"],
+    "check_args": ["--check-only"],
+    # No safe local "fix" mode: running without `--check-only` pushes to the
+    # `huggingface/transformers-metadata` Hub dataset (requires an auth token).
+    # `fix_args=None` makes `make fix-repo` skip this checker, like other check-only ones.
+    "fix_args": None,
+}
 
 # All paths are set with the intent you should run this script from the root of the repo with the command
 # python utils/update_metadata.py
@@ -65,8 +78,8 @@ PIPELINE_TAGS_AND_AUTO_MODELS = [
     ("automatic-speech-recognition", "MODEL_FOR_CTC_MAPPING_NAMES", "AutoModelForCTC"),
     ("image-classification", "MODEL_FOR_IMAGE_CLASSIFICATION_MAPPING_NAMES", "AutoModelForImageClassification"),
     ("image-segmentation", "MODEL_FOR_IMAGE_SEGMENTATION_MAPPING_NAMES", "AutoModelForImageSegmentation"),
+    ("any-to-any", "MODEL_FOR_MULTIMODAL_LM_MAPPING_NAMES", "AutoModelForMultimodalLM"),
     ("image-text-to-text", "MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES", "AutoModelForImageTextToText"),
-    ("image-to-image", "MODEL_FOR_IMAGE_TO_IMAGE_MAPPING_NAMES", "AutoModelForImageToImage"),
     ("fill-mask", "MODEL_FOR_MASKED_LM_MAPPING_NAMES", "AutoModelForMaskedLM"),
     ("object-detection", "MODEL_FOR_OBJECT_DETECTION_MAPPING_NAMES", "AutoModelForObjectDetection"),
     (
@@ -106,7 +119,6 @@ PIPELINE_TAGS_AND_AUTO_MODELS = [
         "MODEL_FOR_VISUAL_QUESTION_ANSWERING_MAPPING_NAMES",
         "AutoModelForVisualQuestionAnswering",
     ),
-    ("image-to-text", "MODEL_FOR_VISION_2_SEQ_MAPPING_NAMES", "AutoModelForVision2Seq"),
     (
         "zero-shot-image-classification",
         "MODEL_FOR_ZERO_SHOT_IMAGE_CLASSIFICATION_MAPPING_NAMES",
@@ -215,16 +227,19 @@ def update_pipeline_and_auto_class_table(table: dict[str, tuple[str, str]]) -> d
     for pipeline_tag, model_mapping, cls in PIPELINE_TAGS_AND_AUTO_MODELS:
         if not hasattr(module, model_mapping):
             continue
-        # First extract all model_names
-        model_names = []
-        for name in getattr(module, model_mapping).values():
-            if isinstance(name, str):
-                model_names.append(name)
-            else:
-                model_names.extend(list(name))
 
-        # Add pipeline tag and auto model class for those models
-        table.update(dict.fromkeys(model_names, (pipeline_tag, cls)))
+        # Iterate over all model_names for given mapping
+        for names in getattr(module, model_mapping).values():
+            if isinstance(names, str):
+                names = [names]
+
+            for name in names:
+                # For multimodal LLMs, keep the fine-grained pipeline tag but use a generic `AutoClass`
+                if name in MODEL_FOR_MULTIMODAL_LM_MAPPING_NAMES.values():
+                    cls = "AutoModelForMultimodalLM"
+
+                # Add pipeline tag and auto model class for those models
+                table[name] = (pipeline_tag, cls)
 
     return table
 

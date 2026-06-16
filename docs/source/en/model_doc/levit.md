@@ -13,13 +13,10 @@ specific language governing permissions and limitations under the License.
 rendered properly in your Markdown viewer.
 
 -->
-*This model was released on 2021-04-02 and added to Hugging Face Transformers on 2022-06-01.*
+*This model was published in HF papers on 2021-04-02 and contributed to Hugging Face Transformers on 2022-06-01.*
 
 # LeViT
 
-<div class="flex flex-wrap space-x-1">
-<img alt="PyTorch" src="https://img.shields.io/badge/PyTorch-DE3412?style=flat&logo=pytorch&logoColor=white">
-</div>
 
 ## Overview
 
@@ -56,7 +53,7 @@ This model was contributed by [anugunj](https://huggingface.co/anugunj). The ori
   one takes the average prediction between both heads as final prediction. (2) is also called "fine-tuning with distillation",
   because one relies on a teacher that has already been fine-tuned on the downstream dataset. In terms of models, (1) corresponds
   to [`LevitForImageClassification`] and (2) corresponds to [`LevitForImageClassificationWithTeacher`].
-- All released checkpoints were pre-trained and fine-tuned on  [ImageNet-1k](https://huggingface.co/datasets/imagenet-1k)
+- All released checkpoints were pre-trained and fine-tuned on  [ImageNet-1k](https://huggingface.co/datasets/ILSVRC/imagenet-1k)
   (also referred to as ILSVRC 2012, a collection of 1.3 million images and 1,000 classes). only. No external data was used. This is in
   contrast with the original ViT model, which used external data like the JFT-300M dataset/Imagenet-21k for
   pre-training.
@@ -90,9 +87,9 @@ If you're interested in submitting a resource to be included here, please feel f
   [[autodoc]] LevitImageProcessor
     - preprocess
 
-## LevitImageProcessorFast
+## LevitImageProcessorPil
 
-  [[autodoc]] LevitImageProcessorFast
+[[autodoc]] LevitImageProcessorPil
     - preprocess
 
 ## LevitModel

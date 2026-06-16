@@ -14,13 +14,14 @@
 
 from typing import TYPE_CHECKING
 
-from ..utils import OptionalDependencyNotAvailable, _LazyModule, is_torch_available
+from ..utils import OptionalDependencyNotAvailable, _LazyModule, is_rich_available, is_torch_available
 
 
 _import_structure = {
     "configuration_utils": [
         "BaseWatermarkingConfig",
         "CompileConfig",
+        "ContinuousBatchingConfig",
         "GenerationConfig",
         "GenerationMode",
         "SynthIDTextWatermarkingConfig",
@@ -86,7 +87,11 @@ else:
         "StopStringCriteria",
     ]
     _import_structure["continuous_batching"] = [
+        "ContinuousBatchingManager",
         "ContinuousMixin",
+        "FIFOScheduler",
+        "PrefillFirstScheduler",
+        "Scheduler",
     ]
     _import_structure["utils"] = [
         "GenerationMixin",
@@ -102,12 +107,20 @@ else:
         "BayesianDetectorConfig",
         "SynthIDTextWatermarkDetector",
     ]
+try:
+    if not is_rich_available():
+        raise OptionalDependencyNotAvailable()
+except OptionalDependencyNotAvailable:
+    pass
+else:
+    _import_structure["streamers"] += ["TextDiffusionStreamer"]
 
 
 if TYPE_CHECKING:
     from .configuration_utils import (
         BaseWatermarkingConfig,
         CompileConfig,
+        ContinuousBatchingConfig,
         GenerationConfig,
         GenerationMode,
         SynthIDTextWatermarkingConfig,
@@ -127,7 +140,13 @@ if TYPE_CHECKING:
             EarlyExitCandidateGenerator,
             PromptLookupCandidateGenerator,
         )
-        from .continuous_batching import ContinuousMixin
+        from .continuous_batching import (
+            ContinuousBatchingManager,
+            ContinuousMixin,
+            FIFOScheduler,
+            PrefillFirstScheduler,
+            Scheduler,
+        )
         from .logits_process import (
             AlternatingCodebooksLogitsProcessor,
             ClassifierFreeGuidanceLogitsProcessor,
@@ -186,6 +205,13 @@ if TYPE_CHECKING:
             WatermarkDetector,
             WatermarkDetectorOutput,
         )
+    try:
+        if not is_rich_available():
+            raise OptionalDependencyNotAvailable()
+    except OptionalDependencyNotAvailable:
+        pass
+    else:
+        from .streamers import TextDiffusionStreamer
 
 else:
     import sys

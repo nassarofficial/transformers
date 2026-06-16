@@ -1,4 +1,3 @@
-# coding=utf-8
 # Copyright 2022 EleutherAI and the HuggingFace Inc. team. All rights reserved.
 #
 # This code is based on EleutherAI's GPT-NeoX library and the GPT-NeoX
@@ -21,12 +20,13 @@
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Optional, Union
+from typing import Any
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
+from ... import initialization as init
 from ...activations import ACT2FN
 from ...cache_utils import Cache, DynamicCache
 from ...generation import GenerationMixin
@@ -36,7 +36,8 @@ from ...modeling_outputs import ModelOutput
 from ...modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedConfig, PreTrainedModel
 from ...processing_utils import Unpack
 from ...utils import TransformersKwargs, auto_docstring, can_return_tuple, logging
-from ...utils.generic import OutputRecorder, check_model_inputs
+from ...utils.generic import merge_with_config_defaults
+from ...utils.output_capturing import OutputRecorder, capture_outputs
 from .configuration_idefics import IdeficsConfig
 from .perceiver import IdeficsPerceiverResampler
 from .vision import IdeficsVisionEmbeddings, IdeficsVisionTransformer
@@ -45,12 +46,12 @@ from .vision import IdeficsVisionEmbeddings, IdeficsVisionTransformer
 logger = logging.get_logger(__name__)
 
 
-@dataclass
 @auto_docstring(
     custom_intro="""
     Base class for Idefics model's outputs that may also contain a past key/values (to speed up sequential decoding).
     """
 )
+@dataclass
 class IdeficsBaseModelOutputWithPast(ModelOutput):
     r"""
     last_hidden_state (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`):
@@ -71,19 +72,19 @@ class IdeficsBaseModelOutputWithPast(ModelOutput):
         image_hidden_states of the model produced by the vision encoder, and optionally by the perceiver
     """
 
-    last_hidden_state: Optional[torch.FloatTensor] = None
-    past_key_values: Optional[Cache] = None
-    hidden_states: Optional[tuple[torch.FloatTensor]] = None
-    attentions: Optional[tuple[torch.FloatTensor]] = None
-    image_hidden_states: Optional[tuple[torch.FloatTensor]] = None
+    last_hidden_state: torch.FloatTensor | None = None
+    past_key_values: Cache | None = None
+    hidden_states: tuple[torch.FloatTensor] | None = None
+    attentions: tuple[torch.FloatTensor] | None = None
+    image_hidden_states: tuple[torch.FloatTensor] | None = None
 
 
-@dataclass
 @auto_docstring(
     custom_intro="""
     Base class for Idefics causal language model (or autoregressive) outputs.
     """
 )
+@dataclass
 class IdeficsCausalLMOutputWithPast(ModelOutput):
     r"""
     loss (`torch.FloatTensor` of shape `(1,)`, *optional*, returned when `labels` is provided):
@@ -102,12 +103,12 @@ class IdeficsCausalLMOutputWithPast(ModelOutput):
         image_hidden_states of the model produced by the vision encoder, and optionally by the perceiver
     """
 
-    loss: Optional[torch.FloatTensor] = None
-    logits: Optional[torch.FloatTensor] = None
-    past_key_values: Optional[Cache] = None
-    hidden_states: Optional[tuple[torch.FloatTensor]] = None
-    attentions: Optional[tuple[torch.FloatTensor]] = None
-    image_hidden_states: Optional[tuple[torch.FloatTensor]] = None
+    loss: torch.FloatTensor | None = None
+    logits: torch.FloatTensor | None = None
+    past_key_values: Cache | None = None
+    hidden_states: tuple[torch.FloatTensor] | None = None
+    attentions: tuple[torch.FloatTensor] | None = None
+    image_hidden_states: tuple[torch.FloatTensor] | None = None
 
 
 def expand_inputs_for_generation(
@@ -155,7 +156,7 @@ def expand_inputs_for_generation(
     return input_ids, model_kwargs
 
 
-def freeze_model(model, module_exceptions=[]):
+def freeze_model(model, module_exceptions=()):
     mapping = {
         "LayerNorm": nn.LayerNorm,
         "Linear": nn.Linear,
@@ -184,7 +185,7 @@ class IdeficsDecoupledEmbedding(nn.Embedding):
         num_embeddings,
         num_additional_embeddings,
         embedding_dim,
-        partially_freeze: Optional[bool] = False,
+        partially_freeze: bool | None = False,
         device=None,
         dtype=None,
         padding_idx=None,
@@ -457,7 +458,7 @@ def eager_attention_forward(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-    attention_mask: Optional[torch.Tensor],
+    attention_mask: torch.Tensor | None,
     scaling: float,
     dropout: float = 0.0,
     **kwargs,
@@ -485,9 +486,9 @@ class IdeficsAttention(nn.Module):
         num_heads: int,
         dropout: float = 0.0,
         is_cross_attention: bool = False,
-        config: Optional[PreTrainedConfig] = None,
+        config: PreTrainedConfig | None = None,
         qk_layer_norms: bool = False,
-        layer_idx: Optional[int] = None,
+        layer_idx: int | None = None,
     ):
         super().__init__()
         self.config = config
@@ -566,11 +567,10 @@ class IdeficsAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        key_value_states: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
-        cache_position: Optional[torch.LongTensor] = None,
+        key_value_states: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # if key_value_states are provided this layer is used as a cross-attention layer
@@ -591,7 +591,7 @@ class IdeficsAttention(nn.Module):
 
         kv_seq_len = key_states.shape[-2]
         if past_key_values is not None:
-            kv_seq_len += cache_position[0]
+            kv_seq_len += past_key_values.get_seq_length()
 
         if not is_cross_attention:
             cos, sin = self.rotary_emb(value_states, seq_len=max(kv_seq_len, q_len))
@@ -599,18 +599,15 @@ class IdeficsAttention(nn.Module):
         # [bsz, nh, t, hd]
 
         if past_key_values is not None:
-            # sin and cos are specific to RoPE models; cache_position needed for the static cache
-            cache_kwargs = {"cache_position": cache_position}
-            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
+            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
         if self.qk_layer_norms:
             query_states = self.q_layer_norm(query_states)
             key_states = self.k_layer_norm(key_states)
 
-        attention_interface: Callable = eager_attention_forward
-
-        if self.config._attn_implementation != "eager":
-            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
+            self.config._attn_implementation, eager_attention_forward
+        )
 
         attn_output, attn_weights = attention_interface(
             self,
@@ -631,7 +628,7 @@ class IdeficsAttention(nn.Module):
 
 # this was adapted from LlamaDecoderLayer
 class IdeficsDecoderLayer(GradientCheckpointingLayer):
-    def __init__(self, config: IdeficsConfig, layer_idx: Optional[int] = None):
+    def __init__(self, config: IdeficsConfig, layer_idx: int | None = None):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.self_attn = IdeficsAttention(
@@ -654,10 +651,9 @@ class IdeficsDecoderLayer(GradientCheckpointingLayer):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
-        cache_position: Optional[torch.LongTensor] = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.FloatTensor:
         residual = hidden_states
@@ -670,7 +666,6 @@ class IdeficsDecoderLayer(GradientCheckpointingLayer):
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
-            cache_position=cache_position,
             **kwargs,
         )
         hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
@@ -687,7 +682,7 @@ class IdeficsDecoderLayer(GradientCheckpointingLayer):
 
 
 class IdeficsGatedCrossAttentionLayer(GradientCheckpointingLayer):
-    def __init__(self, config: IdeficsConfig, layer_idx: Optional[int] = None):
+    def __init__(self, config: IdeficsConfig, layer_idx: int | None = None):
         super().__init__()
         self.hidden_size = config.hidden_size
         self.cross_attn = IdeficsAttention(
@@ -757,11 +752,11 @@ class IdeficsGatedCrossAttentionLayer(GradientCheckpointingLayer):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        image_hidden_states: Optional[torch.Tensor] = None,
-        image_attention_mask: Optional[torch.Tensor] = None,
-        cross_attention_gate: Optional[torch.Tensor] = None,
-        past_key_values: Optional[Cache] = None,
+        attention_mask: torch.Tensor | None = None,
+        image_hidden_states: torch.Tensor | None = None,
+        image_attention_mask: torch.Tensor | None = None,
+        cross_attention_gate: torch.Tensor | None = None,
+        past_key_values: Cache | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> torch.FloatTensor:
         r"""
@@ -817,9 +812,9 @@ class IdeficsGatedCrossAttentionLayer(GradientCheckpointingLayer):
 class IdeficsPreTrainedModel(PreTrainedModel):
     config: IdeficsConfig
     base_model_prefix = "model"
-    input_modalities = ["image", "text"]
+    input_modalities = ("image", "text")
     supports_gradient_checkpointing = True
-    _no_split_modules = ["IdeficsDecoderLayer", "IdeficsGatedCrossAttentionLayer"]
+    _no_split_modules = ["IdeficsDecoderLayer", "IdeficsGatedCrossAttentionLayer", "IdeficsVisionEncoderLayer"]
     _supports_sdpa = True
 
     _supports_flash_attn = False  # only eager/sdpa creation is supported
@@ -831,38 +826,36 @@ class IdeficsPreTrainedModel(PreTrainedModel):
         "attentions": OutputRecorder(IdeficsAttention, index=1, layer_name="self_attn"),
     }
 
+    @torch.no_grad()
     def _init_weights(self, module):
         # important: this ported version of Idefics isn't meant for training from scratch - only
         # inference and fine-tuning - so the proper init weights code has been removed - the m4 code
         # base should be used for training from scratch and it contains the correct code.
-        std = self.config.initializer_range
-        if isinstance(module, (nn.Linear, nn.Conv2d)):
-            module.weight.data.normal_(mean=0.0, std=std)
-            if module.bias is not None:
-                module.bias.data.zero_()
-        elif isinstance(module, nn.Embedding):
-            module.weight.data.normal_(mean=0.0, std=std)
-            if module.padding_idx is not None:
-                module.weight.data[module.padding_idx].zero_()
-        elif isinstance(module, nn.LayerNorm):
-            module.weight.data.fill_(1.0)
-            module.bias.data.zero_()
-        elif isinstance(module, IdeficsRMSNorm):
-            module.weight.data.fill_(1.0)
-        elif isinstance(module, IdeficsVisionEmbeddings):
-            module.class_embedding.data.normal_()
+        super()._init_weights(module)
+        if isinstance(module, IdeficsVisionEmbeddings):
+            init.normal_(module.class_embedding)
+            init.copy_(module.position_ids, torch.arange(module.position_ids.shape[-1]).expand((1, -1)))
         elif isinstance(module, IdeficsGatedCrossAttentionLayer):
             if self.config.alpha_initializer == "zeros":
-                module.alpha_cross_attn.data.zero_()
-                module.alpha_dense.data.zero_()
+                init.zeros_(module.alpha_cross_attn)
+                init.zeros_(module.alpha_dense)
             elif self.config.alpha_initializer == "ones":
-                module.alpha_cross_attn.data.fill_(1.0)
-                module.alpha_dense.data.fill_(1.0)
+                init.ones_(module.alpha_cross_attn)
+                init.ones_(module.alpha_dense)
             elif self.config.alpha_initializer in {"normal", "gaussian", "random"}:
-                module.alpha_cross_attn.data.normal_(mean=0.0, std=self.config.alphas_initializer_range)
-                module.alpha_dense.data.normal_(mean=0.0, std=self.config.alphas_initializer_range)
+                init.normal_(module.alpha_cross_attn, mean=0.0, std=self.config.alphas_initializer_range)
+                init.normal_(module.alpha_dense, mean=0.0, std=self.config.alphas_initializer_range)
         elif isinstance(module, IdeficsPerceiverResampler):
-            module.latents.data.normal_()
+            init.normal_(module.latents)
+        elif isinstance(module, IdeficsEmbedding):
+            inv_freq = 1.0 / (module.base ** (torch.arange(0, module.dim, 2) / module.dim))
+            init.copy_(module.inv_freq, inv_freq)
+            t = torch.arange(module.max_position_embeddings).type_as(inv_freq)
+            freqs = torch.einsum("i,j->ij", t, inv_freq)
+            # Different from paper, but it uses a different permutation in order to obtain the same calculation
+            emb = torch.cat((freqs, freqs), dim=-1)
+            init.copy_(module.cos_cached, emb.cos())
+            init.copy_(module.sin_cached, emb.sin())
 
 
 @auto_docstring
@@ -934,31 +927,31 @@ class IdeficsModel(IdeficsPreTrainedModel):
         if config.freeze_vision_layers:
             freeze_model(self.vision_model, module_exceptions=config.freeze_vision_module_exceptions)
 
-    def freeze_text_layers(self, module_exceptions=[]):
+    def freeze_text_layers(self, module_exceptions=()):
         for module in [self.layers, self.norm]:
             freeze_model(module, module_exceptions=module_exceptions)
 
-    def freeze_vision_layers(self, module_exceptions=[]):
+    def freeze_vision_layers(self, module_exceptions=()):
         freeze_model(self.vision_model, module_exceptions=module_exceptions)
 
-    @check_model_inputs()
+    @merge_with_config_defaults
+    @capture_outputs
     @auto_docstring
     def forward(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        pixel_values: Optional[torch.FloatTensor] = None,
-        image_encoder_embeddings: Optional[torch.FloatTensor] = None,
-        perceiver_embeddings: Optional[torch.FloatTensor] = None,
-        image_attention_mask: Optional[torch.Tensor] = None,
-        use_cache: Optional[bool] = None,
-        interpolate_pos_encoding: Optional[bool] = False,
-        cache_position: Optional[torch.LongTensor] = None,
+        input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        pixel_values: torch.FloatTensor | None = None,
+        image_encoder_embeddings: torch.FloatTensor | None = None,
+        perceiver_embeddings: torch.FloatTensor | None = None,
+        image_attention_mask: torch.Tensor | None = None,
+        use_cache: bool | None = None,
+        interpolate_pos_encoding: bool | None = False,
         **kwargs: Unpack[TransformersKwargs],
-    ) -> Union[tuple, IdeficsBaseModelOutputWithPast]:
+    ) -> tuple | IdeficsBaseModelOutputWithPast:
         r"""
         image_encoder_embeddings (`torch.FloatTensor`, *optional*):
             The output of the image encoder.
@@ -978,14 +971,9 @@ class IdeficsModel(IdeficsPreTrainedModel):
         if use_cache and past_key_values is None:
             past_key_values = DynamicCache(config=self.config)
 
-        batch_size, seq_length, _ = inputs_embeds.shape
+        seq_length = inputs_embeds.shape[1]
         past_key_values_length = past_key_values.get_seq_length() if past_key_values is not None else 0
         seq_length_with_past = seq_length + past_key_values_length
-
-        if cache_position is None:
-            cache_position = torch.arange(
-                past_key_values_length, past_key_values_length + inputs_embeds.shape[1], device=inputs_embeds.device
-            )
 
         if attention_mask is not None and position_ids is None:
             # create position_ids on the fly for batch generation
@@ -993,7 +981,8 @@ class IdeficsModel(IdeficsPreTrainedModel):
             position_ids.masked_fill_(attention_mask == 0, 1)
             position_ids = position_ids[:, -seq_length:]
         elif position_ids is None:
-            position_ids = cache_position.unsqueeze(0)
+            position_ids = torch.arange(seq_length, device=inputs_embeds.device) + past_key_values_length
+            position_ids = position_ids.unsqueeze(0)
 
         if sum(x is None for x in [pixel_values, image_encoder_embeddings, perceiver_embeddings]) != 2:
             raise ValueError(
@@ -1028,30 +1017,26 @@ class IdeficsModel(IdeficsPreTrainedModel):
             raise ValueError("If `perceiver_embeddings` are passed, use_resampler should be True")
 
         image_hidden_states = image_hidden_states.view(batch_size, num_images * image_seq_len, image_hidden_size)
-        # # Hack to use the model in full language modeling mode
-        # image_attention_mask = torch.zeros(batch_size, seq_length, 1, dtype=torch.long, device=image_hidden_states.device)
-        # Make image_attention_mask compatible with hidden states
-        text_seq_len = image_attention_mask.size(1)
-        image_attention_mask = image_attention_mask.unsqueeze(-1)
-        image_attention_mask = image_attention_mask.repeat(1, 1, 1, image_seq_len)
-        image_attention_mask = image_attention_mask.view(batch_size, text_seq_len, num_images * image_seq_len)
 
-        if image_hidden_states is not None:
-            image_batch_size, image_sequence_length, _ = image_hidden_states.size()
-            image_hidden_shape = (image_batch_size, image_sequence_length)
-            if image_attention_mask is None:
-                image_attention_mask = torch.ones(image_hidden_shape, device=device)
-            image_attention_mask = self.invert_attention_mask(image_attention_mask)
-        else:
-            image_attention_mask = None
+        # Mask is in 3D (incompatible with our mask API --> manual expansion)
+        # image_attention_mask:    [batch_size,    text_seq_length,       num_images          ]
+        #                       -> [batch_size, 1, text_seq_length, num_images * image_seq_len]
+        image_attention_mask = (
+            image_attention_mask[..., None]
+            .expand(-1, -1, -1, image_seq_len)
+            .reshape(*image_attention_mask.shape[:2], -1)
+        )
+        image_attention_mask = torch.where(
+            image_attention_mask[:, None, :, :].bool(),
+            torch.tensor(0.0, device=device, dtype=image_hidden_states.dtype),
+            torch.finfo(image_hidden_states.dtype).min,
+        )
 
-        # cross_attention_gate:
         # For any tokens attending to no images, the hidden_states coming out of the cross-attention should be zeroed-out.
-        # `image_attention_mask` has shape [bsz, 1, num_images, hidden_size] with elements equal to either 0.0 or a very negative number.
         # If any of the elements are 0.0, then the token is attending to at least one image and the gate value is 1. Otherwise the gate value is 0.
         # `cross_attention_gate` has shape [bsz, seq_len] with elements equal to either 0.0 or 1.0.
-        cross_attention_gate = ((((image_attention_mask == 0.0).any(dim=-1)).to(dtype=self.dtype)).squeeze(dim=1)).to(
-            device
+        cross_attention_gate = (
+            (image_attention_mask == 0.0).any(dim=-1).to(dtype=self.dtype, device=device).squeeze(dim=1)
         )
 
         # embed positions
@@ -1062,9 +1047,8 @@ class IdeficsModel(IdeficsPreTrainedModel):
 
         causal_mask = create_causal_mask(
             config=self.config,
-            input_embeds=inputs_embeds,
+            inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
-            cache_position=cache_position,
             past_key_values=past_key_values,
             position_ids=position_ids,
         )
@@ -1090,7 +1074,6 @@ class IdeficsModel(IdeficsPreTrainedModel):
                 attention_mask=causal_mask,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
-                cache_position=cache_position,
                 **kwargs,
             )
 
@@ -1105,7 +1088,7 @@ class IdeficsModel(IdeficsPreTrainedModel):
 
 
 class IdeficsForVisionText2Text(IdeficsPreTrainedModel, GenerationMixin):
-    _tied_weights_keys = ["model.embed_tokens.weight", "lm_head.weight"]
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
     def __init__(self, config, vision_model=None):
         super().__init__(config)
@@ -1118,51 +1101,34 @@ class IdeficsForVisionText2Text(IdeficsPreTrainedModel, GenerationMixin):
             bias=False,
             partially_freeze=config.freeze_lm_head,
         )
+        if config.additional_vocab_size > 0:
+            self._tied_weights_keys = {
+                "lm_head.weight": "model.embed_tokens.weight",
+                "lm_head.additional_fc.weight": "model.embed_tokens.additional_embedding.weight",
+            }
 
         # Initialize weights and apply final processing
         self.post_init()
-
-    def tie_weights(self):
-        """
-        Overwrite `transformers.modeling_utils.PreTrainedModel.tie_weights` to handle the case of
-        IdeficsDecoupledLinear and IdeficsDecoupledEmbedding.
-        """
-        output_embeddings = self.get_output_embeddings()
-        input_embeddings = self.get_input_embeddings()
-
-        if getattr(self.config, "tie_word_embeddings", True):
-            output_embeddings.weight = input_embeddings.weight
-            if input_embeddings.num_additional_embeddings > 0:
-                assert output_embeddings.out_additional_features == input_embeddings.num_additional_embeddings
-                output_embeddings.additional_fc.weight = input_embeddings.additional_embedding.weight
-
-        if hasattr(output_embeddings, "out_features") and hasattr(input_embeddings, "num_embeddings"):
-            output_embeddings.out_features = input_embeddings.num_embeddings
-            if hasattr(output_embeddings, "out_additional_features") and hasattr(
-                input_embeddings, "num_additional_embeddings"
-            ):
-                output_embeddings.out_additional_features = input_embeddings.num_additional_embeddings
 
     @can_return_tuple
     @auto_docstring
     def forward(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        pixel_values: Optional[torch.FloatTensor] = None,
-        image_encoder_embeddings: Optional[torch.FloatTensor] = None,
-        perceiver_embeddings: Optional[torch.FloatTensor] = None,
-        image_attention_mask: Optional[torch.Tensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
-        interpolate_pos_encoding: Optional[bool] = False,
-        cache_position: Optional[torch.LongTensor] = None,
-        logits_to_keep: Union[int, torch.Tensor] = 0,
+        input_ids: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        pixel_values: torch.FloatTensor | None = None,
+        image_encoder_embeddings: torch.FloatTensor | None = None,
+        perceiver_embeddings: torch.FloatTensor | None = None,
+        image_attention_mask: torch.Tensor | None = None,
+        labels: torch.LongTensor | None = None,
+        use_cache: bool | None = None,
+        interpolate_pos_encoding: bool | None = False,
+        logits_to_keep: int | torch.Tensor = 0,
         **kwargs: Unpack[TransformersKwargs],
-    ) -> Union[tuple, IdeficsCausalLMOutputWithPast]:
+    ) -> tuple | IdeficsCausalLMOutputWithPast:
         r"""
         image_encoder_embeddings (`torch.FloatTensor`, *optional*):
             The output of the image encoder.
@@ -1213,7 +1179,6 @@ class IdeficsForVisionText2Text(IdeficsPreTrainedModel, GenerationMixin):
             use_cache=use_cache,
             interpolate_pos_encoding=interpolate_pos_encoding,
             return_dict=True,
-            cache_position=cache_position,
             **kwargs,
         )
 
@@ -1242,7 +1207,6 @@ class IdeficsForVisionText2Text(IdeficsPreTrainedModel, GenerationMixin):
         position_ids=None,
         inputs_embeds=None,
         past_key_values=None,
-        cache_position=None,
         pixel_values=None,
         image_hidden_states=None,
         image_attention_mask=None,
@@ -1266,7 +1230,6 @@ class IdeficsForVisionText2Text(IdeficsPreTrainedModel, GenerationMixin):
             past_key_values=past_key_values,
             attention_mask=attention_mask,
             inputs_embeds=inputs_embeds,
-            cache_position=cache_position,
             position_ids=position_ids,
             use_cache=use_cache,
             image_attention_mask=image_attention_mask,

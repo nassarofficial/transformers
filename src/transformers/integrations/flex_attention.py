@@ -32,12 +32,25 @@ import torch
 from packaging import version
 
 from ..utils import is_torch_flex_attn_available, logging
-from ..utils.import_utils import get_torch_version, is_torch_less_or_equal, is_torchdynamo_compiling
+from ..utils.import_utils import (
+    get_torch_version,
+    is_torch_greater_or_equal,
+    is_torch_less_or_equal,
+    is_torchdynamo_compiling,
+)
+
+
+_TORCH_FLEX_USE_AUX = is_torch_greater_or_equal("2.9.0")
 
 
 if is_torch_flex_attn_available():
     from torch.nn.attention.flex_attention import _DEFAULT_SPARSE_BLOCK_SIZE as flex_default_block_size
     from torch.nn.attention.flex_attention import BlockMask, create_block_mask, flex_attention
+
+    if _TORCH_FLEX_USE_AUX:
+        from torch.nn.attention.flex_attention import AuxRequest
+    else:
+        AuxRequest = None
 
 
 logger = logging.get_logger(__name__)
@@ -84,13 +97,27 @@ class WrappedFlexAttention:
         return self._compiled_flex_attention
 
 
+def get_flex_attention_lse_kwargs(return_lse: bool) -> dict[str, bool | Optional["AuxRequest"]]:
+    """
+    Requests the LSE from flex_attention in a version-agnostic fashion.
+
+    Before torch 2.9, the LSE was requested via the boolean return_lse field. However, starting with
+    torch 2.9, an AuxRequest object must be passed via the aux_request field. This method conditionally
+    returns the correct form based on the python version.
+    """
+    if _TORCH_FLEX_USE_AUX:
+        return {"return_aux": AuxRequest(lse=True) if return_lse else None}
+
+    return {"return_lse": return_lse}
+
+
 def compile_friendly_flex_attention(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
     training=False,
     **kwargs,
-) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     # First call initialise singleton wrapper object, second call invokes the object method to return compiled flex attention
     # Do not use compiled version if already compiling forward (it raises issues)
     flex_attention_compiled = WrappedFlexAttention(training)() if not is_torchdynamo_compiling() else flex_attention
@@ -102,17 +129,17 @@ def compile_friendly_flex_attention(
     )
 
 
-Offset = Union[torch.Tensor, int]
+Offset = torch.Tensor | int
 
 
 # TODO: deprecate / rename to make_flex_block_mask for clarity as it's not only causal anymore
 def make_flex_block_causal_mask(
     attention_mask_2d: torch.Tensor,
-    attention_chunk_size: Optional[int] = None,
+    attention_chunk_size: int | None = None,
     query_length=None,
     key_length=None,
-    offsets: Optional[tuple[Offset, Offset]] = None,
-    is_causal: Optional[bool] = True,
+    offsets: tuple[Offset, Offset] | None = None,
+    is_causal: bool | None = True,
 ) -> "BlockMask":
     """
     IMPORTANT NOTICE: This function is deprecated in favor of using the mask primitives in `masking_utils.py`,
@@ -238,11 +265,11 @@ def flex_attention_forward(
     key: torch.Tensor,
     value: torch.Tensor,
     attention_mask: Union[torch.Tensor, "BlockMask"],
-    scaling: Optional[float] = None,
-    softcap: Optional[float] = None,
-    s_aux: Optional[torch.Tensor] = None,
+    scaling: float | None = None,
+    softcap: float | None = None,
+    s_aux: torch.Tensor | None = None,
     **kwargs,
-) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+) -> tuple[torch.Tensor, torch.Tensor | None]:
     if kwargs.get("dropout", 0.0) > 0:
         raise ValueError(
             "`flex_attention` does not support `dropout`. Please use it with inference"
@@ -298,12 +325,21 @@ def flex_attention_forward(
         kernel_options=kernel_options,
         # Last time checked on PyTorch == 2.5.1: Flex Attention always computes the lse regardless.
         # For simplification, we thus always return it as no additional computations are introduced.
-        return_lse=return_lse,
         training=module.training,
+        # inject the lse args
+        **get_flex_attention_lse_kwargs(return_lse),
     )
-    # lse is returned in float32
+
     if return_lse:
-        attention_output, lse = flex_attention_output  # type: ignore[misc]
+        # before torch 2.9, return_lse returns the LSE directly as a second tuple element
+        # in torch 2.9 and later, return_aux returns AuxOutput as a second tuple element -- the LSE must be extracted
+        if _TORCH_FLEX_USE_AUX:
+            attention_output, aux = flex_attention_output  # type: ignore[misc]
+            lse = aux.lse
+        else:
+            attention_output, lse = flex_attention_output  # type: ignore[misc]
+
+        # lse is returned in float32
         lse = lse.to(value.dtype)
 
         if s_aux is not None:
@@ -320,6 +356,7 @@ def flex_attention_forward(
             # Use new_norm / old_norm = exp(combined_lse - lse) to compute renorm and apply
             renorm_factor = torch.exp(lse_expanded - combined_lse)
             attention_output = attention_output * renorm_factor
+            attention_output = attention_output.to(query.dtype)
     else:
         attention_output = flex_attention_output  # type: ignore[assignment]
         lse = None

@@ -13,7 +13,7 @@ specific language governing permissions and limitations under the License.
 rendered properly in your Markdown viewer.
 
 -->
-*This model was released on 2018-01-13 and added to Hugging Face Transformers on 2022-11-14.*
+*This model was published in HF papers on 2018-01-13 and contributed to Hugging Face Transformers on 2022-11-14.*
 
 <div style="float: right;">
     <div class="flex flex-wrap space-x-1">
@@ -36,13 +36,12 @@ The examples below demonstrate how to classify an image with [`Pipeline`] or the
 <hfoption id="Pipeline">
 
 ```python
-import torch
 from transformers import pipeline
+
 
 pipeline = pipeline(
     task="image-classification",
     model="google/mobilenet_v2_1.4_224",
-    dtype=torch.float16,
     device=0
 )
 pipeline("https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/pipeline-cat-chonk.jpeg")
@@ -52,21 +51,24 @@ pipeline("https://huggingface.co/datasets/huggingface/documentation-images/resol
 <hfoption id="AutoModel">
 
 ```python
-import torch
 import requests
+import torch
 from PIL import Image
-from transformers import AutoModelForImageClassification, AutoImageProcessor
+
+from transformers import AutoImageProcessor, AutoModelForImageClassification
+
 
 image_processor = AutoImageProcessor.from_pretrained(
     "google/mobilenet_v2_1.4_224",
 )
 model = AutoModelForImageClassification.from_pretrained(
     "google/mobilenet_v2_1.4_224",
+    device_map="auto",
 )
 
 url = "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/pipeline-cat-chonk.jpeg"
 image = Image.open(requests.get(url, stream=True).raw)
-inputs = image_processor(image, return_tensors="pt")
+inputs = image_processor(image, return_tensors="pt").to(model.device)
 
 with torch.no_grad():
   logits = model(**inputs).logits
@@ -84,7 +86,7 @@ print(f"The predicted class label is: {predicted_class_label}")
 
 - Classification checkpoint names follow the pattern `mobilenet_v2_{depth_multiplier}_{resolution}`, like `mobilenet_v2_1.4_224`. `1.4` is the depth multiplier and `224` is the image resolution. Segmentation checkpoint names follow the pattern `deeplabv3_mobilenet_v2_{depth_multiplier}_{resolution}`.
 - While trained on images of a specific sizes, the model architecture works with images of different sizes (minimum 32x32). The [`MobileNetV2ImageProcessor`] handles the necessary preprocessing.
-- MobileNet is pretrained on [ImageNet-1k](https://huggingface.co/datasets/imagenet-1k), a dataset with 1000 classes. However, the model actually predicts 1001 classes. The additional class is an extra "background" class (index 0).
+- MobileNet is pretrained on [ImageNet-1k](https://huggingface.co/datasets/ILSVRC/imagenet-1k), a dataset with 1000 classes. However, the model actually predicts 1001 classes. The additional class is an extra "background" class (index 0).
 - The segmentation models use a [DeepLabV3+](https://huggingface.co/papers/1802.02611) head which is often pretrained on datasets like [PASCAL VOC](https://huggingface.co/datasets/merve/pascal-voc).
 - The original TensorFlow checkpoints determines the padding amount at inference because it depends on the input image size. To use the native PyTorch padding behavior, set `tf_padding=False` in [`MobileNetV2Config`].
 
@@ -110,9 +112,9 @@ print(f"The predicted class label is: {predicted_class_label}")
     - preprocess
     - post_process_semantic_segmentation
 
-## MobileNetV2ImageProcessorFast
+## MobileNetV2ImageProcessorPil
 
-[[autodoc]] MobileNetV2ImageProcessorFast
+[[autodoc]] MobileNetV2ImageProcessorPil
     - preprocess
     - post_process_semantic_segmentation
 

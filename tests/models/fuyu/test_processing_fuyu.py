@@ -1,10 +1,22 @@
-import tempfile
+# Copyright 2023 The HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import unittest
-from shutil import rmtree
+
+import numpy as np
 
 from transformers import (
-    AutoProcessor,
-    AutoTokenizer,
     FuyuImageProcessor,
     FuyuProcessor,
     is_torch_available,
@@ -25,41 +37,24 @@ if is_torch_available():
 @require_vision
 class FuyuProcessingTest(ProcessorTesterMixin, unittest.TestCase):
     processor_class = FuyuProcessor
+    model_id = "adept/fuyu-8b"
 
     @classmethod
-    def setUpClass(cls):
-        cls.tmpdirname = tempfile.mkdtemp()
-
-        image_processor = FuyuImageProcessor()
-        tokenizer = AutoTokenizer.from_pretrained("adept/fuyu-8b")
-
-        processor = FuyuProcessor(image_processor=image_processor, tokenizer=tokenizer)
-        processor.save_pretrained(cls.tmpdirname)
-
+    def _setup_test_attributes(cls, processor):
         cls.text_prompt = "Generate a coco-style caption.\\n"
         bus_image_url = url_to_local_path(
             "https://huggingface.co/datasets/hf-internal-testing/fixtures-captioning/resolve/main/bus.png"
         )
         cls.bus_image_pil = load_image(bus_image_url)
 
-    @classmethod
-    def tearDownClass(cls):
-        rmtree(cls.tmpdirname)
+    @unittest.skip("FuyuProcessor doesn't return typical pixel values for images")
+    def test_image_processor_defaults(self):
+        pass
 
-    def get_processor(self):
-        image_processor = FuyuImageProcessor()
-        tokenizer = AutoTokenizer.from_pretrained("adept/fuyu-8b")
-        processor = FuyuProcessor(image_processor, tokenizer, **self.prepare_processor_dict())
+    @unittest.skip("FuyuProcessor doesn't return typical pixel values for images")
+    def test_processor_with_multiple_inputs(self):
+        pass
 
-        return processor
-
-    def get_tokenizer(self, **kwargs):
-        return AutoProcessor.from_pretrained(self.tmpdirname, **kwargs).tokenizer
-
-    def get_image_processor(self, **kwargs):
-        return AutoProcessor.from_pretrained(self.tmpdirname, **kwargs).image_processor
-
-    # Copied from tests.models.llava.test_processing_llava.LlavaProcessorTest.test_get_num_vision_tokens
     def test_get_num_vision_tokens(self):
         "Tests general functionality of the helper used internally in vLLM"
 
@@ -91,7 +86,7 @@ class FuyuProcessingTest(ProcessorTesterMixin, unittest.TestCase):
         Test to check processor works with just text input
         """
         processor_outputs = self.get_processor()(text=self.text_prompt)
-        tokenizer_outputs = self.get_tokenizer()(self.text_prompt)
+        tokenizer_outputs = self.get_component("tokenizer")(self.text_prompt)
         self.assertEqual(processor_outputs["input_ids"], tokenizer_outputs["input_ids"])
 
     def test_fuyu_processing_no_text(self):
@@ -197,7 +192,7 @@ class FuyuProcessingTest(ProcessorTesterMixin, unittest.TestCase):
     @require_vision
     @require_torch
     def test_kwargs_overrides_default_tokenizer_kwargs(self):
-        if "image_processor" not in self.processor_class.attributes:
+        if "image_processor" not in self.processor_class.get_attributes():
             self.skipTest(f"image_processor attribute not present in {self.processor_class}")
         image_processor = self.get_component("image_processor")
         tokenizer = self.get_component("tokenizer", max_length=117)
@@ -225,7 +220,7 @@ class FuyuProcessingTest(ProcessorTesterMixin, unittest.TestCase):
     @require_vision
     @require_torch
     def test_tokenizer_defaults_preserved_by_kwargs(self):
-        if "image_processor" not in self.processor_class.attributes:
+        if "image_processor" not in self.processor_class.get_attributes():
             self.skipTest(f"image_processor attribute not present in {self.processor_class}")
         image_processor = self.get_component("image_processor")
         tokenizer = self.get_component("tokenizer", max_length=117, padding="max_length")
@@ -243,7 +238,7 @@ class FuyuProcessingTest(ProcessorTesterMixin, unittest.TestCase):
     @require_torch
     @require_vision
     def test_structured_kwargs_nested(self):
-        if "image_processor" not in self.processor_class.attributes:
+        if "image_processor" not in self.processor_class.get_attributes():
             self.skipTest(f"image_processor attribute not present in {self.processor_class}")
         image_processor = self.get_component("image_processor")
         tokenizer = self.get_component("tokenizer")
@@ -270,7 +265,7 @@ class FuyuProcessingTest(ProcessorTesterMixin, unittest.TestCase):
     @require_torch
     @require_vision
     def test_structured_kwargs_nested_from_dict(self):
-        if "image_processor" not in self.processor_class.attributes:
+        if "image_processor" not in self.processor_class.get_attributes():
             self.skipTest(f"image_processor attribute not present in {self.processor_class}")
 
         image_processor = self.get_component("image_processor")
@@ -296,7 +291,7 @@ class FuyuProcessingTest(ProcessorTesterMixin, unittest.TestCase):
     @require_torch
     @require_vision
     def test_unstructured_kwargs(self):
-        if "image_processor" not in self.processor_class.attributes:
+        if "image_processor" not in self.processor_class.get_attributes():
             self.skipTest(f"image_processor attribute not present in {self.processor_class}")
         image_processor = self.get_component("image_processor")
         tokenizer = self.get_component("tokenizer")
@@ -321,7 +316,7 @@ class FuyuProcessingTest(ProcessorTesterMixin, unittest.TestCase):
     @require_torch
     @require_vision
     def test_unstructured_kwargs_batched(self):
-        if "image_processor" not in self.processor_class.attributes:
+        if "image_processor" not in self.processor_class.get_attributes():
             self.skipTest(f"image_processor attribute not present in {self.processor_class}")
         image_processor = self.get_component("image_processor")
         tokenizer = self.get_component("tokenizer")
@@ -363,6 +358,30 @@ class FuyuProcessingTest(ProcessorTesterMixin, unittest.TestCase):
         inputs_dict_no_vision = {"text": text, "images": image_inputs_nested}
         inputs_nested = processor(**inputs_dict_no_vision, **processing_kwargs)
         self.assertTrue(self.text_input_name in inputs_nested)
+
+    def test_get_num_multimodal_tokens_matches_processor_call(self):
+        "Tests that the helper used internally in vLLM works correctly"
+
+        # Override -> model siltently ignores multiimage and processes one image per sample
+        processor = self.get_processor()
+
+        if processor.tokenizer.pad_token_id is None:
+            processor.tokenizer.pad_token_id = processor.tokenizer.eos_token_id
+
+        image_sizes = [(100, 100), (300, 100), (500, 30), (213, 167)]
+        image_inputs = []
+        for h, w in image_sizes:
+            image_inputs.append(np.random.randint(255, size=(h, w, 3), dtype=np.uint8))
+
+        image_token = getattr(self, "image_token", "")
+        text = [f"This is an image {image_token}"] * len(image_inputs)
+        inputs = processor(
+            text=text, images=image_inputs, padding=True, return_mm_token_type_ids=True, return_tensors="pt"
+        )
+
+        num_image_tokens_from_call = inputs.mm_token_type_ids.sum(-1).tolist()
+        num_image_tokens_from_helper = processor._get_num_multimodal_tokens(image_sizes=image_sizes)
+        self.assertListEqual(num_image_tokens_from_call, num_image_tokens_from_helper["num_image_tokens"])
 
 
 @require_torch

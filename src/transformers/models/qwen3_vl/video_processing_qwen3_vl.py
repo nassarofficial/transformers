@@ -1,4 +1,3 @@
-# coding=utf-8
 # Copyright 2025 The Qwen Team and The HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,7 +14,6 @@
 """video processor class for Qwen3-VL."""
 
 import math
-from typing import Optional, Union
 
 import numpy as np
 import torch
@@ -23,10 +21,13 @@ import torch
 from ...feature_extraction_utils import BatchFeature
 from ...image_utils import ChannelDimension, PILImageResampling, SizeDict, get_image_size
 from ...processing_utils import Unpack, VideosKwargs
-from ...utils import TensorType, add_start_docstrings, logging
+from ...utils import TensorType, add_start_docstrings, is_torchvision_available, logging
 from ...video_processing_utils import BASE_VIDEO_PROCESSOR_DOCSTRING, BaseVideoProcessor
 from ...video_utils import VideoMetadata, group_videos_by_shape, reorder_videos
 
+
+if is_torchvision_available():
+    from torchvision.transforms.v2 import functional as tvF
 
 logger = logging.get_logger(__name__)
 
@@ -40,8 +41,6 @@ def smart_resize(
     min_pixels: int = 128 * 128,
     max_pixels: int = 16 * 16 * 2 * 2 * 2 * 6144,
 ):
-    if num_frames < temporal_factor:
-        raise ValueError(f"t:{num_frames} must be larger than temporal_factor:{temporal_factor}")
     if height < factor or width < factor:
         raise ValueError(f"height:{height} or width:{width} must be larger than factor:{factor}")
     elif max(height, width) / min(height, width) > 200:
@@ -50,7 +49,7 @@ def smart_resize(
         )
     h_bar = round(height / factor) * factor
     w_bar = round(width / factor) * factor
-    t_bar = round(num_frames / temporal_factor) * temporal_factor
+    t_bar = math.ceil(num_frames / temporal_factor) * temporal_factor
 
     if t_bar * h_bar * w_bar > max_pixels:
         beta = math.sqrt((num_frames * height * width) / max_pixels)
@@ -105,30 +104,23 @@ class Qwen3VLVideoProcessor(BaseVideoProcessor):
 
     def __init__(self, **kwargs: Unpack[Qwen3VLVideoProcessorInitKwargs]):
         super().__init__(**kwargs)
-        if self.size is not None and (
-            self.size.get("shortest_edge", None) is None or self.size.get("longest_edge", None) is None
-        ):
-            raise ValueError("size must contain 'shortest_edge' and 'longest_edge' keys.")
 
-    def _further_process_kwargs(
-        self,
-        size: Optional[SizeDict] = None,
-        **kwargs,
-    ) -> dict:
+    def _standardize_kwargs(self, **kwargs) -> dict:
         """
         Update kwargs that need further processing before being validated
         Can be overridden by subclasses to customize the processing of kwargs.
         """
-        if size is not None and ("shortest_edge" not in size or "longest_edge" not in size):
+        kwargs = super()._standardize_kwargs(**kwargs)
+        size = kwargs.get("size", self.size)
+        if not size.shortest_edge or not size.longest_edge:
             raise ValueError("size must contain 'shortest_edge' and 'longest_edge' keys.")
-
-        return super()._further_process_kwargs(size=size, **kwargs)
+        return kwargs
 
     def sample_frames(
         self,
         metadata: VideoMetadata,
-        num_frames: Optional[int] = None,
-        fps: Optional[Union[int, float]] = None,
+        num_frames: int | None = None,
+        fps: int | float | None = None,
         **kwargs,
     ):
         """
@@ -178,23 +170,25 @@ class Qwen3VLVideoProcessor(BaseVideoProcessor):
         videos: list[torch.Tensor],
         do_convert_rgb: bool = True,
         do_resize: bool = True,
-        size: Optional[SizeDict] = None,
-        interpolation: PILImageResampling = PILImageResampling.BICUBIC,
+        size: SizeDict | None = None,
+        resample: "PILImageResampling | tvF.InterpolationMode | int | None" = PILImageResampling.BICUBIC,
         do_rescale: bool = True,
         rescale_factor: float = 1 / 255.0,
         do_normalize: bool = True,
-        image_mean: Optional[Union[float, list[float]]] = None,
-        image_std: Optional[Union[float, list[float]]] = None,
-        patch_size: Optional[int] = None,
-        temporal_patch_size: Optional[int] = None,
-        merge_size: Optional[int] = None,
-        return_tensors: Optional[Union[str, TensorType]] = None,
+        image_mean: float | list[float] | None = None,
+        image_std: float | list[float] | None = None,
+        patch_size: int | None = None,
+        temporal_patch_size: int | None = None,
+        merge_size: int | None = None,
+        return_tensors: str | TensorType | None = None,
         **kwargs,
     ):
         grouped_videos, grouped_videos_index = group_videos_by_shape(videos)
         resized_videos_grouped = {}
 
         for shape, stacked_videos in grouped_videos.items():
+            if do_convert_rgb:
+                stacked_videos = self.convert_to_rgb(stacked_videos)
             B, T, C, H, W = stacked_videos.shape
             num_frames, height, width = T, H, W
             if do_resize:
@@ -211,7 +205,7 @@ class Qwen3VLVideoProcessor(BaseVideoProcessor):
                 stacked_videos = self.resize(
                     stacked_videos,
                     size=SizeDict(height=resized_height, width=resized_width),
-                    interpolation=interpolation,
+                    resample=resample,
                 )
                 stacked_videos = stacked_videos.view(B, T, C, resized_height, resized_width)
             resized_videos_grouped[shape] = stacked_videos
@@ -232,9 +226,10 @@ class Qwen3VLVideoProcessor(BaseVideoProcessor):
             patches = stacked_videos
 
             # Check that videos have `num_frames` divisible by `temporal_patch_size`
-            if patches.shape[1] % temporal_patch_size != 0:
-                repeats = patches[:, -1:].repeat(1, temporal_patch_size - 1, 1, 1, 1)
-                patches = torch.cat([patches, repeats], dim=1)
+            T = patches.shape[1]
+            if pad := -T % temporal_patch_size:
+                repeats = patches[:, -1:].expand(-1, pad, -1, -1, -1)
+                patches = torch.cat((patches, repeats), dim=1)
             batch_size, grid_t, channel = patches.shape[:3]
             grid_t = grid_t // temporal_patch_size
             grid_h, grid_w = resized_height // patch_size, resized_width // patch_size

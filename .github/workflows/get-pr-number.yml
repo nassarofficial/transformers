@@ -6,6 +6,9 @@ on:
         description: "The extracted PR number"
         value: ${{ jobs.get-pr-number.outputs.PR_NUMBER }}
 
+permissions:
+  contents: read
+
 jobs:
   get-pr-number:
     runs-on: ubuntu-22.04
@@ -13,9 +16,6 @@ jobs:
     outputs:
       PR_NUMBER: ${{ steps.set_pr_number.outputs.PR_NUMBER }}
     steps:
-      - uses: GitHubSecurityLab/actions-permissions/monitor@v1
-        with:
-          config: ${{ vars.PERMISSIONS_CONFIG }}
       - name: Get PR number
         shell: bash
         env:

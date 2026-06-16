@@ -13,13 +13,10 @@ specific language governing permissions and limitations under the License.
 rendered properly in your Markdown viewer.
 
 -->
-*This model was released on 2020-06-19 and added to Hugging Face Transformers on 2020-11-16.*
+*This model was published in HF papers on 2020-06-19 and contributed to Hugging Face Transformers on 2020-11-16.*
 
 # SqueezeBERT
 
-<div class="flex flex-wrap space-x-1">
-<img alt="PyTorch" src="https://img.shields.io/badge/PyTorch-DE3412?style=flat&logo=pytorch&logoColor=white">
-</div>
 
 ## Overview
 
@@ -70,9 +67,7 @@ This model was contributed by [forresti](https://huggingface.co/forresti).
 ## SqueezeBertTokenizer
 
 [[autodoc]] SqueezeBertTokenizer
-    - build_inputs_with_special_tokens
     - get_special_tokens_mask
-    - create_token_type_ids_from_sequences
     - save_vocabulary
 
 ## SqueezeBertTokenizerFast

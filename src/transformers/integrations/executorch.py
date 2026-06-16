@@ -11,8 +11,6 @@
 # specific language governing permissions and limitations under the License.
 
 import logging
-from collections.abc import Callable
-from typing import Optional
 
 import torch
 
@@ -22,18 +20,13 @@ from ..cache_utils import (
     DynamicSlidingWindowLayer,
     EncoderDecoderCache,
     StaticCache,
+    StaticLayer,
+    StaticSlidingWindowLayer,
 )
 from ..generation.configuration_utils import GenerationConfig
-from ..masking_utils import (
-    ALL_MASK_ATTENTION_FUNCTIONS,
-    _ignore_causal_mask_sdpa,
-    _is_torch_greater_or_equal_than_2_5,
-    prepare_padding_mask,
-)
-from ..modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
+from ..modeling_utils import PreTrainedModel
 from ..pytorch_utils import (
     is_torch_greater_or_equal,
-    is_torch_greater_or_equal_than_2_3,
     is_torch_greater_or_equal_than_2_6,
 )
 
@@ -200,9 +193,9 @@ class TorchExportableModuleForDecoderOnlyLM(torch.nn.Module):
     def __init__(
         self,
         model: PreTrainedModel,
-        batch_size: Optional[int] = None,
-        max_cache_len: Optional[int] = None,
-        device: Optional[torch.device] = None,
+        batch_size: int | None = None,
+        max_cache_len: int | None = None,
+        device: torch.device | None = None,
     ) -> None:
         """
         Initializes the exportable module.
@@ -229,16 +222,12 @@ class TorchExportableModuleForDecoderOnlyLM(torch.nn.Module):
                 "Using `StaticCache` for export as `layer_types` is not specified or `sliding_window` is `null` in the config."
             )
             self.model = TorchExportableModuleWithStaticCache(model, batch_size, max_cache_len, device)
-        # This is the same as sdpa, but mask creation does not use `vmap` which is not exportable
-        ALL_MASK_ATTENTION_FUNCTIONS.register("sdpa_without_vmap", sdpa_mask_without_vmap)
-        ALL_ATTENTION_FUNCTIONS.register("sdpa_without_vmap", ALL_ATTENTION_FUNCTIONS["sdpa"])
-        self.model.model.config._attn_implementation = "sdpa_without_vmap"
 
     def forward(
         self,
-        input_ids: Optional[torch.Tensor] = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
-        cache_position: Optional[torch.Tensor] = None,
+        input_ids: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        cache_position: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Forward pass of the module, which is compatible with the ExecuTorch llm runner.
@@ -251,19 +240,15 @@ class TorchExportableModuleForDecoderOnlyLM(torch.nn.Module):
         Returns:
             torch.Tensor: Logits output from the model.
         """
-        return self.model.forward(
-            input_ids=input_ids,
-            inputs_embeds=inputs_embeds,
-            cache_position=cache_position,
-        )
+        return self.model.forward(input_ids=input_ids, inputs_embeds=inputs_embeds)
 
     def export(
         self,
-        input_ids: Optional[torch.Tensor] = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
-        cache_position: Optional[torch.Tensor] = None,
-        dynamic_shapes: Optional[dict] = None,
-        strict: Optional[bool] = None,
+        input_ids: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        cache_position: torch.Tensor | None = None,
+        dynamic_shapes: dict | None = None,
+        strict: bool | None = None,
     ) -> torch.export.ExportedProgram:
         """
         Export the wrapped module using `torch.export`.
@@ -458,6 +443,28 @@ class TorchExportableModuleForDecoderOnlyLM(torch.nn.Module):
         return tokenizer.decode(generated_ids[0], skip_special_tokens=True)
 
 
+def get_head_shapes(config) -> tuple[int | list[int], int | list[int]]:
+    """Returns a tuple `(num_heads, head_dim)` containing either 2 ints, or a list of int with the value for each
+    layer."""
+    # Gemma4 has different head_dim and num_heads depending on layer type
+    if hasattr(config, "global_head_dim"):
+        head_dim = [
+            config.global_head_dim if layer == "full_attention" else config.head_dim
+            for layer in config.layer_types[: -config.num_kv_shared_layers]
+        ]
+        num_heads = [
+            config.num_global_key_value_heads
+            if layer == "full_attention" and config.attention_k_eq_v
+            else config.num_key_value_heads
+            for layer in config.layer_types[: -config.num_kv_shared_layers]
+        ]
+    else:
+        head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+        num_heads = getattr(config, "num_key_value_heads", config.num_attention_heads)
+
+    return num_heads, head_dim
+
+
 class TorchExportableModuleWithStaticCache(torch.nn.Module):
     """
     A recipe module designed to make a `PreTrainedModel` exportable with `torch.export`,
@@ -472,9 +479,9 @@ class TorchExportableModuleWithStaticCache(torch.nn.Module):
     def __init__(
         self,
         model: PreTrainedModel,
-        batch_size: Optional[int] = None,
-        max_cache_len: Optional[int] = None,
-        device: Optional[torch.device] = None,
+        batch_size: int | None = None,
+        max_cache_len: int | None = None,
+        device: torch.device | None = None,
     ) -> None:
         """
         Initializes the wrapper module with the pretrained model.
@@ -534,20 +541,27 @@ class TorchExportableModuleWithStaticCache(torch.nn.Module):
         # Initialize the static cache
         self.model = model
         self.static_cache = StaticCache(max_cache_len=max_cache_len, config=config)
-        head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
-        num_heads = getattr(config, "num_key_value_heads", config.num_attention_heads)
+        # Since StaticSlidingWindow have dynamic control flow that cannot be avoided, we have to replace them here by
+        # simple StaticLayer... It means that any generation beyond the window is unfortunately unsupported
+        for i, layer in enumerate(self.static_cache.layers):
+            if isinstance(layer, StaticSlidingWindowLayer):
+                self.static_cache.layers[i] = StaticLayer(max_cache_len)
+        num_heads, head_dim = get_head_shapes(config)
         dtype = self.model.dtype
         # We need this call to initialize all the layers (otherwise it's done lazily, which is not exportable)
         self.static_cache.early_initialization(batch_size, num_heads, head_dim, dtype, device)
-        for i in range(len(self.static_cache)):
-            self.register_buffer(f"key_cache_{i}", self.static_cache.layers[i].keys, persistent=False)
-            self.register_buffer(f"value_cache_{i}", self.static_cache.layers[i].values, persistent=False)
+
+        # Register cache buffers to make them exportable
+        for i, layer in enumerate(self.static_cache.layers):
+            self.register_buffer(f"key_cache_{i}", layer.keys, persistent=False)
+            self.register_buffer(f"value_cache_{i}", layer.values, persistent=False)
+            self.register_buffer(f"cumulative_length_{i}", layer.cumulative_length, persistent=False)
 
     def forward(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
-        cache_position: Optional[torch.Tensor] = None,
+        input_ids: torch.LongTensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        cache_position: torch.Tensor | None = None,
     ):
         """
         Forward pass of the module, which is compatible with the ExecuTorch runtime.
@@ -570,12 +584,17 @@ class TorchExportableModuleWithStaticCache(torch.nn.Module):
             The adapter matches the model's forward signature with that in `executorch/extension/llm/runner`,
             ensuring that the exported model can be executed in `ExecuTorch` out-of-the-box.
         """
+        # Start by resetting static cache (it's needed to be able to run several generations with the same exported program,
+        # as otherwise it's mutated in-place indefinitely - we cannot call reset in-between the `generate` as the program was
+        # already exported)
+        for layer in self.static_cache.layers:
+            layer.cumulative_length.copy_(cache_position[0:1])
+
         past_key_values = self.static_cache
 
         outs = self.model(
             input_ids=input_ids,
             inputs_embeds=inputs_embeds,
-            cache_position=cache_position,
             attention_mask=None,
             past_key_values=past_key_values,
             use_cache=True,
@@ -651,9 +670,9 @@ class TorchExportableModuleWithHybridCache(torch.nn.Module):
     def __init__(
         self,
         model: PreTrainedModel,
-        batch_size: Optional[int] = None,
-        max_cache_len: Optional[int] = None,
-        device: Optional[torch.device] = None,
+        batch_size: int | None = None,
+        max_cache_len: int | None = None,
+        device: torch.device | None = None,
     ) -> None:
         """
         Initializes the exportable module.
@@ -700,22 +719,27 @@ class TorchExportableModuleWithHybridCache(torch.nn.Module):
 
         # Initialize the cache
         self.cache = StaticCache(config=config, max_cache_len=max_cache_len)
-        head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
-        num_heads = getattr(config, "num_key_value_heads", config.num_attention_heads)
+        # Since StaticSlidingWindow have dynamic control flow that cannot be avoided, we have to replace them here by
+        # simple StaticLayer... It means that any generation beyond the window is unfortunately unsupported
+        for i, layer in enumerate(self.cache.layers):
+            if isinstance(layer, StaticSlidingWindowLayer):
+                self.cache.layers[i] = StaticLayer(max_cache_len)
+        num_heads, head_dim = get_head_shapes(config)
         dtype = self.model.dtype
         # We need this call to initialize all the layers (otherwise it's done lazily, which is not exportable)
         self.cache.early_initialization(batch_size, num_heads, head_dim, dtype, device)
 
-        # Register all key and value cache tensors as buffers
-        for i in range(len(self.cache)):
-            self.register_buffer(f"key_cache_{i}", self.cache.layers[i].keys, persistent=False)
-            self.register_buffer(f"value_cache_{i}", self.cache.layers[i].values, persistent=False)
+        # Register cache buffers to make them exportable
+        for i, layer in enumerate(self.cache.layers):
+            self.register_buffer(f"key_cache_{i}", layer.keys, persistent=False)
+            self.register_buffer(f"value_cache_{i}", layer.values, persistent=False)
+            self.register_buffer(f"cumulative_length_{i}", layer.cumulative_length, persistent=False)
 
     def forward(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
-        cache_position: Optional[torch.Tensor] = None,
+        input_ids: torch.LongTensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        cache_position: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Forward pass of the module, which is compatible with the ExecuTorch llm runner.
@@ -728,11 +752,16 @@ class TorchExportableModuleWithHybridCache(torch.nn.Module):
         Returns:
             torch.Tensor: Logits output from the model.
         """
+        # Start by resetting static cache (it's needed to be able to run several generations with the same exported program,
+        # as otherwise it's mutated in-place indefinitely - we cannot call reset in-between the `generate` as the program was
+        # already exported)
+        for layer in self.cache.layers:
+            layer.cumulative_length.copy_(cache_position[0:1])
+
         # Forward pass with the model
         outputs = self.model(
             input_ids=input_ids,
             inputs_embeds=inputs_embeds,
-            cache_position=cache_position,
             attention_mask=None,
             past_key_values=self.cache,
             use_cache=True,
@@ -744,10 +773,10 @@ class TorchExportableModuleWithHybridCache(torch.nn.Module):
 
 def convert_and_export_with_cache(
     model: PreTrainedModel,
-    example_input_ids: Optional[torch.Tensor] = None,
-    example_cache_position: Optional[torch.Tensor] = None,
-    dynamic_shapes: Optional[dict] = None,
-    strict: Optional[bool] = None,
+    example_input_ids: torch.Tensor | None = None,
+    example_cache_position: torch.Tensor | None = None,
+    dynamic_shapes: dict | None = None,
+    strict: bool | None = None,
 ):
     """
     Convert a `PreTrainedModel` into an exportable module and export it using `torch.export`,
@@ -763,15 +792,8 @@ def convert_and_export_with_cache(
     Returns:
         Exported program (`torch.export.ExportedProgram`): The exported program generated via `torch.export`.
     """
-    if not is_torch_greater_or_equal_than_2_3:
-        raise ImportError("torch >= 2.3 is required.")
 
     import torch.export._trace
-
-    # This is the same as sdpa, but mask creation does not use `vmap` which is not exportable
-    ALL_MASK_ATTENTION_FUNCTIONS.register("sdpa_without_vmap", sdpa_mask_without_vmap)
-    ALL_ATTENTION_FUNCTIONS.register("sdpa_without_vmap", ALL_ATTENTION_FUNCTIONS["sdpa"])
-    model.config._attn_implementation = "sdpa_without_vmap"
 
     with torch.no_grad():
         # TODO: The default inputs only work for text models. We need to add support for vision/audio models.
@@ -850,26 +872,36 @@ class Seq2SeqLMDecoderExportableModuleWithStaticCache(torch.nn.Module):
 
         # Initialize static cache for decoder and DynamicCache for encoder
         self.static_cache = StaticCache(config=self.config, max_cache_len=max_static_cache_length)
-        head_dim = getattr(self.config, "head_dim", self.config.hidden_size // self.config.num_attention_heads)
-        num_heads = getattr(self.config, "num_key_value_heads", self.config.num_attention_heads)
+        # Since StaticSlidingWindow have dynamic control flow that cannot be avoided, we have to replace them here by
+        # simple StaticLayer... It means that any generation beyond the window is unfortunately unsupported
+        for i, layer in enumerate(self.static_cache.layers):
+            if isinstance(layer, StaticSlidingWindowLayer):
+                self.static_cache.layers[i] = StaticLayer(max_static_cache_length)
+        num_heads, head_dim = get_head_shapes(self.config)
         self.static_cache.early_initialization(batch_size, num_heads, head_dim, torch.float32, model_device)
         self.cache = EncoderDecoderCache(self.static_cache, DynamicCache(config=self.config))
 
         register_dynamic_cache_export_support()
 
         # Register cache buffers to make them exportable
-        for i in range(len(self.static_cache)):
-            self.register_buffer(f"key_cache_{i}", self.static_cache.layers[i].keys, persistent=False)
-            self.register_buffer(f"value_cache_{i}", self.static_cache.layers[i].values, persistent=False)
+        for i, layer in enumerate(self.static_cache.layers):
+            self.register_buffer(f"key_cache_{i}", layer.keys, persistent=False)
+            self.register_buffer(f"value_cache_{i}", layer.values, persistent=False)
+            self.register_buffer(f"cumulative_length_{i}", layer.cumulative_length, persistent=False)
 
     def forward(self, decoder_input_ids, encoder_hidden_states, cache_position):
+        # Start by resetting static cache (it's needed to be able to run several generations with the same exported program,
+        # as otherwise it's mutated in-place indefinitely - we cannot call reset in-between the `generate` as the program was
+        # already exported)
+        for layer in self.static_cache.layers:
+            layer.cumulative_length.copy_(cache_position[0:1])
+
         # Get outputs from decoder
         outputs = self.decoder(
             input_ids=decoder_input_ids,
             encoder_hidden_states=encoder_hidden_states,
             past_key_values=self.cache,
             use_cache=True,
-            cache_position=cache_position,
         )
 
         # Apply language model head
@@ -896,6 +928,7 @@ class Seq2SeqLMExportableModule(torch.nn.Module):
                 "batch_size": batch_size,
                 "max_cache_len": max_cache_length,
             },
+            eos_token_id=model.generation_config.eos_token_id,
         )
         self.exported_encoder = None
         self.exported_decoder = None
@@ -1011,7 +1044,7 @@ class Seq2SeqLMExportableModule(torch.nn.Module):
                 decoder_input_ids = torch.tensor([[next_token]], dtype=torch.long, device=model_device)
 
                 # Check if EOS token
-                if next_token == self.config.eos_token_id:
+                if next_token == self.generation_config.eos_token_id:
                     break
 
             return generated_ids
@@ -1019,8 +1052,8 @@ class Seq2SeqLMExportableModule(torch.nn.Module):
 
 def export_with_dynamic_cache(
     model: PreTrainedModel,
-    example_input_ids: Optional[torch.Tensor] = None,
-    example_attention_mask: Optional[torch.Tensor] = None,
+    example_input_ids: torch.Tensor | None = None,
+    example_attention_mask: torch.Tensor | None = None,
 ):
     """
     Export a model with DynamicCache using `torch.export`, ensuring the exported model is compatible with `ExecuTorch`.
@@ -1033,13 +1066,6 @@ def export_with_dynamic_cache(
     Returns:
         Exported program (`torch.export.ExportedProgram`): The exported program generated via `torch.export`.
     """
-    if not is_torch_greater_or_equal_than_2_3:
-        raise ImportError("torch >= 2.3 is required.")
-
-    # This is the same as sdpa, but mask creation does not use `vmap` which is not exportable
-    ALL_MASK_ATTENTION_FUNCTIONS.register("sdpa_without_vmap", sdpa_mask_without_vmap)
-    ALL_ATTENTION_FUNCTIONS.register("sdpa_without_vmap", ALL_ATTENTION_FUNCTIONS["sdpa"])
-    model.config._attn_implementation = "sdpa_without_vmap"
 
     register_dynamic_cache_export_support()
 
@@ -1109,92 +1135,3 @@ def _unflatten_dynamic_cache(values, context: torch.utils._pytree.Context):
         value = value_list[idx] if idx < len(value_list) else None
         cache.update(key, value, idx)
     return cache
-
-
-def sdpa_mask_without_vmap(
-    batch_size: int,
-    cache_position: torch.Tensor,
-    kv_length: int,
-    kv_offset: int = 0,
-    mask_function: Optional[Callable] = None,
-    attention_mask: Optional[torch.Tensor] = None,
-    local_size: Optional[int] = None,
-    allow_is_causal_skip: bool = True,
-    allow_torch_fix: bool = True,
-    **kwargs,
-) -> Optional[torch.Tensor]:
-    """
-    Create a 4D boolean mask of shape `(batch_size, 1, query_length, kv_length)` where a value of True indicates that
-    the element should take part in the attention computation, and False that it should not.
-
-    This is similar to `masking_utils.sdpa_mask` but does not use `vmap` which is incompatible with export.
-
-    Args:
-        batch_size (`int`):
-            The batch size of the input sequence.
-        cache_position (`torch.Tensor`):
-            A tensor of shape (query_length,) indicating the current indices of the input sequence elements.
-        kv_length (`int`):
-            The size that the key and value states will have during the attention computation.
-        kv_offset (`int`, optional):
-            An optional offset to indicate at which first position the key and values states will refer to.
-        mask_function (`Callable`):
-            The mask factory function describing the mask pattern.
-        attention_mask (`torch.Tensor`, optional):
-            The 2D attention mask corresponding to padded tokens of shape (batch_size, number_of_seen_tokens+q_length)
-        local_size (`int`, optional):
-            The size of the local attention, if we do not use full attention. This is used only if `allow_is_causal_skip=True`
-            to try to skip mask creation if possible.
-        allow_is_causal_skip (`bool`, optional):
-            Whether to allow to return `None` for the mask under conditions where we can use the `is_causal` argument in
-            `torch.sdpa` instead. Default to `True`.
-        allow_torch_fix (`bool`, optional):
-            Whether to update the mask in case a query is not attending to any tokens, to solve a bug in torch's older
-            versions. We need an arg to skip it when using eager. By default `True`.
-
-    """
-
-    q_length = cache_position.shape[0]
-    # Potentially pad the 2D mask, and slice it correctly
-    padding_mask = prepare_padding_mask(attention_mask, kv_length, kv_offset)
-
-    #  Under specific conditions, we can avoid materializing the mask, instead relying on the `is_causal` argument
-    if allow_is_causal_skip and _ignore_causal_mask_sdpa(padding_mask, q_length, kv_length, local_size):
-        return None
-
-    # Similar to `kv_arange = torch.arange(start=kv_offset, end=kv_offset + kv_length, device=cache_position.device)`
-    # but without data-dependent slicing (i.e. torch.compile friendly)
-    kv_arange = torch.arange(kv_length, device=cache_position.device)
-    kv_arange += kv_offset
-    reshaped_cache_position = cache_position.view(-1, 1)
-
-    # This is a bit hacky to know what pattern we are using, but all mask creation function actually forward
-    # the config through kwargs anyway, so it allows to rely on it
-    # Usually, the `mask_function` is the only entry-point to define the pattern - we could do for loops over it,
-    # but this is more efficient
-    sliding_window = getattr(kwargs["config"], "sliding_window", None)
-    chunk_size = getattr(kwargs["config"], "attention_chunk_size", None)
-
-    if sliding_window is not None and chunk_size is not None:
-        raise ValueError("Cannot use both `sliding_window` and `attention_chunk_size`")
-
-    # Simplest and most efficient way to obtain a causal mask
-    causal_mask = kv_arange <= reshaped_cache_position
-    # If using sliding window, add the sliding mask
-    if sliding_window is not None:
-        sliding_mask_overlay = kv_arange > reshaped_cache_position - sliding_window
-        causal_mask *= sliding_mask_overlay
-    # If using chunk attention, add the chunked mask
-    elif chunk_size is not None:
-        chunked_mask_overlay = kv_arange // chunk_size == reshaped_cache_position // chunk_size
-        causal_mask *= chunked_mask_overlay
-
-    causal_mask = causal_mask[None, None, :, :].expand(batch_size, -1, -1, -1)
-    if padding_mask is not None:
-        causal_mask = causal_mask * padding_mask[:, None, None, :]
-
-    # Due to a bug in some older torch version, we need to update the mask in case a query is not attending to any
-    # tokens (due to padding). See details in https://github.com/pytorch/pytorch/issues/110213
-    if not _is_torch_greater_or_equal_than_2_5 and allow_torch_fix:
-        causal_mask |= torch.all(~causal_mask, dim=-1, keepdim=True)
-    return causal_mask

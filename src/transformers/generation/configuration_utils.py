@@ -1,4 +1,3 @@
-# coding=utf-8
 # Copyright 2022 The HuggingFace Inc. team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -23,21 +22,22 @@ from dataclasses import dataclass, is_dataclass
 from typing import TYPE_CHECKING, Any, Optional, Union
 
 from .. import __version__
-from ..configuration_utils import PreTrainedConfig
 from ..utils import (
     GENERATION_CONFIG_NAME,
     ExplicitEnum,
     PushToHubMixin,
     cached_file,
-    download_url,
     extract_commit_hash,
-    is_remote_url,
+    hf_api,
     is_torch_available,
     logging,
 )
 
 
 if TYPE_CHECKING:
+    import torch
+
+    from ..configuration_utils import PreTrainedConfig
     from ..modeling_utils import PreTrainedModel
 
 
@@ -59,6 +59,23 @@ ALL_CACHE_IMPLEMENTATIONS = ALL_STATIC_CACHE_IMPLEMENTATIONS + DYNAMIC_CACHE_IMP
 
 if is_torch_available():
     from .logits_process import SynthIDTextWatermarkLogitsProcessor, WatermarkLogitsProcessor
+
+
+def _should_warn(outer_attr: str, inner_attr: str, user_set_attributes: set | None) -> bool:
+    """Determine if we should raise a warning for the combination `outer_attr` and `inner_attr`, based on whether
+    they were provided explicitly, i.e. if they were in `user_set_attributes`.
+    For example, if `outer_attr="do_sample"`, the warnings should be suppressed for `inner_attr` flags (e.g. "top_p") that weren't
+    explicitly set by the caller. When `do_sample=False` is explicitly required by the user, values such as `top_p` inherited
+    from a model's `generation_config.json` are harmless when the user opts for greedy decoding.
+    """
+    outer_sample_set = user_set_attributes is not None and outer_attr in user_set_attributes
+    inner_attr_set = user_set_attributes is not None and inner_attr in user_set_attributes
+    # We should warn only if both are explicitly set, none are set, or only the inner_attr is set while outer_attr is not
+    return (
+        (outer_sample_set and inner_attr_set)
+        or (not outer_sample_set and not inner_attr_set)
+        or (inner_attr_set and not outer_sample_set)
+    )
 
 
 class GenerationMode(ExplicitEnum):
@@ -101,20 +118,25 @@ class GenerationConfig(PushToHubMixin):
 
     </Tip>
 
-    Arg:
+    Note: the configuration fields that are still `None` will be overridden by `GenerationConfig._get_default_generation_params()`
+    during the generation loop. If you want to use different values for these fields, make sure to explicitly set them in the
+    generation config.
+
+    Args:
         > Parameters that control the length of the output
 
-        max_length (`int`, *optional*, defaults to 20):
-            The maximum length the generated tokens can have. Corresponds to the length of the input prompt +
-            `max_new_tokens`. Its effect is overridden by `max_new_tokens`, if also set.
+        max_length (`int`, *optional*):
+            `max_new_tokens` is recommended for controlling how many tokens the model generates.
+            `max_length` remains for backward compatibility.
+
         max_new_tokens (`int`, *optional*):
             The maximum numbers of tokens to generate, ignoring the number of tokens in the prompt.
-        min_length (`int`, *optional*, defaults to 0):
+        min_length (`int`, *optional*):
             The minimum length of the sequence to be generated. Corresponds to the length of the input prompt +
             `min_new_tokens`. Its effect is overridden by `min_new_tokens`, if also set.
         min_new_tokens (`int`, *optional*):
             The minimum numbers of tokens to generate, ignoring the number of tokens in the prompt.
-        early_stopping (`bool` or `str`, *optional*, defaults to `False`):
+        early_stopping (`bool` or `str`, *optional*):
             Controls the stopping condition for beam-based methods, like beam-search. It accepts the following values:
             `True`, where the generation stops as soon as there are `num_beams` complete candidates; `False`, where an
             heuristic is applied and the generation stops when is it very unlikely to find better candidates;
@@ -123,22 +145,22 @@ class GenerationConfig(PushToHubMixin):
         max_time (`float`, *optional*):
             The maximum amount of time you allow the computation to run for in seconds. generation will still finish
             the current pass after allocated time has been passed.
-        stop_strings (`str or list[str]`, *optional*):
+        stop_strings (`str` or `list[str]`, *optional*):
             A string or a list of strings that should terminate generation if the model outputs them.
 
         > Parameters that control the generation strategy used
 
-        do_sample (`bool`, *optional*, defaults to `False`):
+        do_sample (`bool`):
             Whether or not to use sampling ; use greedy decoding otherwise.
-        num_beams (`int`, *optional*, defaults to 1):
+        num_beams (`int`, *optional*):
             Number of beams for beam search. 1 means no beam search.
 
         > Parameters that control the cache
 
-        use_cache (`bool`, *optional*, defaults to `True`):
+        use_cache (`bool`):
             Whether or not the model should use the past last key/values attentions (if applicable to the model) to
             speed up decoding.
-        cache_implementation (`str`, *optional*, default to `None`):
+        cache_implementation (`str`, *optional*):
             Name of the cache class that will be instantiated in `generate`, for faster decoding. Possible values are:
 
             - `"dynamic"`: [`DynamicCache`]
@@ -154,11 +176,11 @@ class GenerationConfig(PushToHubMixin):
 
         > Parameters for manipulation of the model output logits
 
-        temperature (`float`, *optional*, defaults to 1.0):
+        temperature (`float`, *optional*):
             The value used to module the next token probabilities. This value is set in a model's `generation_config.json` file. If it isn't set, the default value is 1.0
-        top_k (`int`, *optional*, defaults to 50):
+        top_k (`int`, *optional*):
             The number of highest probability vocabulary tokens to keep for top-k-filtering. This value is set in a model's `generation_config.json` file. If it isn't set, the default value is 50.
-        top_p (`float`, *optional*, defaults to 1.0):
+        top_p (`float`, *optional*):
             If set to float < 1, only the smallest set of most probable tokens with probabilities that add up to
             `top_p` or higher are kept for generation. This value is set in a model's `generation_config.json` file. If it isn't set, the default value is 1.0
         min_p (`float`, *optional*):
@@ -171,41 +193,41 @@ class GenerationConfig(PushToHubMixin):
             is kept whose *renormalized* entropy is less than or equal to `top_h` times the entropy of the full distribution.
             Smaller values (e.g., 0.2–0.5) lead to more focused, deterministic outputs, while values closer to 1.0 allow more
             randomness and diversity. Typical values are in the 0.3–0.6 range.
-        typical_p (`float`, *optional*, defaults to 1.0):
+        typical_p (`float`, *optional*):
             Local typicality measures how similar the conditional probability of predicting a target token next is to
             the expected conditional probability of predicting a random token next, given the partial text already
             generated. If set to float < 1, the smallest set of the most locally typical tokens with probabilities that
             add up to `typical_p` or higher are kept for generation. See [this
             paper](https://huggingface.co/papers/2202.00666) for more details.
-        epsilon_cutoff (`float`, *optional*, defaults to 0.0):
+        epsilon_cutoff (`float`, *optional*):
             If set to float strictly between 0 and 1, only tokens with a conditional probability greater than
             `epsilon_cutoff` will be sampled. In the paper, suggested values range from 3e-4 to 9e-4, depending on the
             size of the model. See [Truncation Sampling as Language Model
             Desmoothing](https://huggingface.co/papers/2210.15191) for more details.
-        eta_cutoff (`float`, *optional*, defaults to 0.0):
+        eta_cutoff (`float`, *optional*):
             Eta sampling is a hybrid of locally typical sampling and epsilon sampling. If set to float strictly between
             0 and 1, a token is only considered if it is greater than either `eta_cutoff` or `sqrt(eta_cutoff) *
             exp(-entropy(softmax(next_token_logits)))`. The latter term is intuitively the expected next token
             probability, scaled by `sqrt(eta_cutoff)`. In the paper, suggested values range from 3e-4 to 2e-3,
             depending on the size of the model. See [Truncation Sampling as Language Model
             Desmoothing](https://huggingface.co/papers/2210.15191) for more details.
-        repetition_penalty (`float`, *optional*, defaults to 1.0):
+        repetition_penalty (`float`, *optional*):
             The parameter for repetition penalty. 1.0 means no penalty. See [this
             paper](https://huggingface.co/papers/1909.05858) for more details.
-        encoder_repetition_penalty (`float`, *optional*, defaults to 1.0):
+        encoder_repetition_penalty (`float`, *optional*):
             The parameter for encoder_repetition_penalty. An exponential penalty on sequences that are not in the
             original input. 1.0 means no penalty.
-        length_penalty (`float`, *optional*, defaults to 1.0):
+        length_penalty (`float`, *optional*):
             Exponential penalty to the length that is used with beam-based generation. It is applied as an exponent to
             the sequence length, which in turn is used to divide the score of the sequence. Since the score is the log
             likelihood of the sequence (i.e. negative), `length_penalty` > 0.0 promotes longer sequences, while
             `length_penalty` < 0.0 encourages shorter sequences.
-        no_repeat_ngram_size (`int`, *optional*, defaults to 0):
+        no_repeat_ngram_size (`int`, *optional*):
             If set to int > 0, all ngrams of that size can only occur once.
         bad_words_ids (`list[list[int]]`, *optional*):
             List of list of token ids that are not allowed to be generated. Check
             [`~generation.NoBadWordsLogitsProcessor`] for further documentation and examples.
-        renormalize_logits (`bool`, *optional*, defaults to `False`):
+        renormalize_logits (`bool`):
             Whether to renormalize the logits after applying all the logits processors (including the custom
             ones). It's highly recommended to set this flag to `True` as the search algorithms suppose the score logits
             are normalized but some logit processors break the normalization.
@@ -216,7 +238,7 @@ class GenerationConfig(PushToHubMixin):
         forced_eos_token_id (`int` or list[int]`, *optional*, defaults to `model.config.forced_eos_token_id`):
             The id of the token to force as the last generated token when `max_length` is reached. Optionally, use a
             list to set multiple *end-of-sequence* tokens.
-        remove_invalid_values (`bool`, *optional*, defaults to `model.config.remove_invalid_values`):
+        remove_invalid_values (`bool`):
             Whether to remove possible *nan* and *inf* outputs of the model to prevent the generation method to crash.
             Note that using `remove_invalid_values` can slow down generation.
         exponential_decay_length_penalty (`tuple(int, float)`, *optional*):
@@ -233,7 +255,7 @@ class GenerationConfig(PushToHubMixin):
             Dictionary that maps a sequence of tokens to its bias term. Positive biases increase the odds of the
             sequence being selected, while negative biases do the opposite. Check
             [`~generation.SequenceBiasLogitsProcessor`] for further documentation and examples.
-        token_healing (`bool`, *optional*, defaults to `False`):
+        token_healing (`bool`):
             Heal tail tokens of prompts by replacing them with their appropriate extensions.
             This enhances the quality of completions for prompts affected by greedy tokenization bias.
         guidance_scale (`float`, *optional*):
@@ -247,20 +269,20 @@ class GenerationConfig(PushToHubMixin):
 
         > Parameters that define the output variables of generate
 
-        num_return_sequences (`int`, *optional*, defaults to 1):
+        num_return_sequences (`int`, *optional*):
             The number of independently computed returned sequences for each element in the batch.
-        output_attentions (`bool`, *optional*, defaults to `False`):
+        output_attentions (`bool`):
             Whether or not to return the attentions tensors of all attention layers. See `attentions` under returned
             tensors for more details.
-        output_hidden_states (`bool`, *optional*, defaults to `False`):
+        output_hidden_states (`bool`):
             Whether or not to return the hidden states of all layers. See `hidden_states` under returned tensors for
             more details.
-        output_scores (`bool`, *optional*, defaults to `False`):
+        output_scores (`bool`):
             Whether or not to return the prediction scores. See `scores` under returned tensors for more details.
-        output_logits (`bool`, *optional*):
+        output_logits (`bool`):
             Whether or not to return the unprocessed prediction logit scores. See `logits` under returned tensors for
             more details.
-        return_dict_in_generate (`bool`, *optional*, defaults to `False`):
+        return_dict_in_generate (`bool`):
             Whether or not to return a [`~utils.ModelOutput`], as opposed to returning exclusively the generated
             sequence. This flag must be set to `True` to return the generation cache (when `use_cache` is `True`)
             or optional outputs (see flags starting with `output_`)
@@ -276,7 +298,7 @@ class GenerationConfig(PushToHubMixin):
 
         > Generation parameters exclusive to encoder-decoder models
 
-        encoder_no_repeat_ngram_size (`int`, *optional*, defaults to 0):
+        encoder_no_repeat_ngram_size (`int`, *optional*):
             If set to int > 0, all ngrams of that size that occur in the `encoder_input_ids` cannot occur in the
             `decoder_input_ids`.
         decoder_start_token_id (`int` or `list[int]`, *optional*):
@@ -285,20 +307,20 @@ class GenerationConfig(PushToHubMixin):
             (e.g. multilingual models with different target languages in one batch)
 
         > Generation parameters exclusive to assistant generation
-        is_assistant (`bool`, *optional*, defaults to `False`):
+        is_assistant (`bool`):
             Whether the model is an assistant (draft) model.
-        num_assistant_tokens (`int`, *optional*, defaults to 20):
+        num_assistant_tokens (`int`, *optional*):
             Defines the number of _speculative tokens_ that shall be generated by the assistant model before being
             checked by the target model at each iteration. Higher values for `num_assistant_tokens` make the generation
             more _speculative_ : If the assistant model is performant larger speed-ups can be reached, if the assistant
             model requires lots of corrections, lower speed-ups are reached.
-        num_assistant_tokens_schedule (`str`, *optional*, defaults to `"constant"`):
+        num_assistant_tokens_schedule (`str`, *optional*):
             Defines the schedule at which max assistant tokens shall be changed during inference.
             - `"heuristic"`: When all speculative tokens are correct, increase `num_assistant_tokens` by 2 else
               reduce by 1. `num_assistant_tokens` value is persistent over multiple generation calls with the same assistant model.
             - `"heuristic_transient"`: Same as `"heuristic"` but `num_assistant_tokens` is reset to its initial value after each generation call.
             - `"constant"`: `num_assistant_tokens` stays unchanged during generation
-        assistant_confidence_threshold (`float`, *optional*, defaults to 0.4):
+        assistant_confidence_threshold (`float`, *optional*):
             The confidence threshold for the assistant model. If the assistant model's confidence in its prediction for the current token is lower
             than this threshold, the assistant model stops the current token generation iteration, even if the number of _speculative tokens_
             (defined by `num_assistant_tokens`) is not yet reached. The assistant's confidence threshold is adjusted throughout the speculative iterations to reduce the number of unnecessary draft and target forward passes, biased towards avoiding false negatives.
@@ -312,11 +334,11 @@ class GenerationConfig(PushToHubMixin):
         assistant_early_exit(`int`, *optional*):
             If set to a positive integer, early exit of the model will be used as an assistant. Can only be used with
             models that support early exit (i.e. models where logits from intermediate layers can be interpreted by the LM head).
-        assistant_lookbehind(`int`, *optional*, defaults to 10):
+        assistant_lookbehind(`int`, *optional*):
             If set to a positive integer, the re-encodeing process will additionally consider the last `assistant_lookbehind` assistant tokens
             to correctly align tokens. Can only be used with different tokenizers in speculative decoding.
             See this [blog](https://huggingface.co/blog/universal_assisted_generation) for more details.
-        target_lookbehind(`int`, *optional*, defaults to 10):
+        target_lookbehind(`int`, *optional*):
             If set to a positive integer, the re-encodeing process will additionally consider the last `target_lookbehind` target tokens
             to correctly align tokens. Can only be used with different tokenizers in speculative decoding.
             See this [blog](https://huggingface.co/blog/universal_assisted_generation) for more details.
@@ -326,7 +348,7 @@ class GenerationConfig(PushToHubMixin):
         compile_config (CompileConfig, *optional*):
             If using a compilable cache, this controls how `generate` will `compile` the forward pass for faster
             inference.
-        disable_compile (`bool`, *optional*):
+        disable_compile (`bool`):
             Whether to disable the automatic compilation of the forward pass. Automatic compilation happens when
             specific criteria are met, including using a compilable cache. Please open an issue if you find the
             need to use this flag.
@@ -334,67 +356,75 @@ class GenerationConfig(PushToHubMixin):
 
     extra_output_flags = ("output_attentions", "output_hidden_states", "output_scores", "output_logits")
 
+    # Tensor versions of token IDs, set by _prepare_special_tokens() at generation time
+    _bos_token_tensor: "torch.Tensor | None"
+    _eos_token_tensor: "torch.Tensor | None"
+    _pad_token_tensor: "torch.Tensor | None"
+    _decoder_start_token_tensor: "torch.Tensor | None"
+
+    # Hash to detect whether the instance was modified after loading
+    _original_object_hash: int | None
+
     def __init__(self, **kwargs):
+        # Snapshot of the attributes the caller explicitly provided (before the `kwargs.pop(...)` calls below
+        # consume them). Used by `validate()` to restrict "minor issue" warnings to flags actually set by the user,
+        # as opposed to defaults inherited from a model's `generation_config.json`.
+        user_set_attributes = set(kwargs.keys())
+
         # Parameters that control the length of the output
-        self.max_length = kwargs.pop("max_length", 20)
+        self.max_length = kwargs.pop("max_length", None)
         self.max_new_tokens = kwargs.pop("max_new_tokens", None)
-        self.min_length = kwargs.pop("min_length", 0)
+        self.min_length = kwargs.pop("min_length", None)
         self.min_new_tokens = kwargs.pop("min_new_tokens", None)
-        self.early_stopping = kwargs.pop("early_stopping", False)
+        self.early_stopping = kwargs.pop("early_stopping", None)
         self.max_time = kwargs.pop("max_time", None)
         self.stop_strings = kwargs.pop("stop_strings", None)
 
         # Parameters that control the generation strategy used
-        self.do_sample = kwargs.pop("do_sample", False)
-        self.num_beams = kwargs.pop("num_beams", 1)
+        self.do_sample = kwargs.pop("do_sample", None)
+        self.num_beams = kwargs.pop("num_beams", None)
 
         # Parameters that control the cache
-        self.use_cache = kwargs.pop("use_cache", True)
+        self.use_cache = kwargs.pop("use_cache", None)
         self.cache_implementation = kwargs.pop("cache_implementation", None)
         self.cache_config = kwargs.pop("cache_config", None)
 
-        self.prefill_chunk_size = kwargs.pop("prefill_chunk_size", None)
-
         # Parameters for manipulation of the model output logits
-        self.temperature = kwargs.pop("temperature", 1.0)
-        self.top_k = kwargs.pop("top_k", 50)
-        self.top_p = kwargs.pop("top_p", 1.0)
+        self.temperature = kwargs.pop("temperature", None)
+        self.top_k = kwargs.pop("top_k", None)
+        self.top_p = kwargs.pop("top_p", None)
         self.min_p = kwargs.pop("min_p", None)
         self.top_h = kwargs.pop("top_h", None)
-        self.typical_p = kwargs.pop("typical_p", 1.0)
-        self.epsilon_cutoff = kwargs.pop("epsilon_cutoff", 0.0)
-        self.eta_cutoff = kwargs.pop("eta_cutoff", 0.0)
-        self.repetition_penalty = kwargs.pop("repetition_penalty", 1.0)
-        self.encoder_repetition_penalty = kwargs.pop("encoder_repetition_penalty", 1.0)
-        self.length_penalty = kwargs.pop("length_penalty", 1.0)
-        self.no_repeat_ngram_size = kwargs.pop("no_repeat_ngram_size", 0)
+        self.typical_p = kwargs.pop("typical_p", None)
+        self.epsilon_cutoff = kwargs.pop("epsilon_cutoff", None)
+        self.eta_cutoff = kwargs.pop("eta_cutoff", None)
+        self.repetition_penalty = kwargs.pop("repetition_penalty", None)
+        self.encoder_repetition_penalty = kwargs.pop("encoder_repetition_penalty", None)
+        self.length_penalty = kwargs.pop("length_penalty", None)
+        self.no_repeat_ngram_size = kwargs.pop("no_repeat_ngram_size", None)
         self.bad_words_ids = kwargs.pop("bad_words_ids", None)
-        self.renormalize_logits = kwargs.pop("renormalize_logits", False)
+        self.renormalize_logits = kwargs.pop("renormalize_logits", None)
         self.forced_bos_token_id = kwargs.pop("forced_bos_token_id", None)
         self.forced_eos_token_id = kwargs.pop("forced_eos_token_id", None)
-        self.remove_invalid_values = kwargs.pop("remove_invalid_values", False)
+        self.remove_invalid_values = kwargs.pop("remove_invalid_values", None)
         self.exponential_decay_length_penalty = kwargs.pop("exponential_decay_length_penalty", None)
         self.suppress_tokens = kwargs.pop("suppress_tokens", None)
         self.begin_suppress_tokens = kwargs.pop("begin_suppress_tokens", None)
         self.sequence_bias = kwargs.pop("sequence_bias", None)
-        self.token_healing = kwargs.pop("token_healing", False)
+        self.token_healing = kwargs.pop("token_healing", None)
         self.guidance_scale = kwargs.pop("guidance_scale", None)
 
-        watermarking_config = kwargs.pop("watermarking_config", None)
-        if watermarking_config is None:
-            self.watermarking_config = None
-        elif isinstance(watermarking_config, BaseWatermarkingConfig):
-            self.watermarking_config = watermarking_config
-        else:
-            self.watermarking_config = WatermarkingConfig.from_dict(watermarking_config)
+        self.watermarking_config = kwargs.pop("watermarking_config", None)
+        if isinstance(self.watermarking_config, dict):
+            self.watermarking_config = WatermarkingConfig.from_dict(self.watermarking_config)
 
         # Parameters that define the output variables of `generate`
-        self.num_return_sequences = kwargs.pop("num_return_sequences", 1)
-        self.output_attentions = kwargs.pop("output_attentions", False)
-        self.output_hidden_states = kwargs.pop("output_hidden_states", False)
-        self.output_scores = kwargs.pop("output_scores", False)
+        self.num_return_sequences = kwargs.pop("num_return_sequences", None)
+        self.output_attentions = kwargs.pop("output_attentions", None)
+        self.output_hidden_states = kwargs.pop("output_hidden_states", None)
+        self.output_scores = kwargs.pop("output_scores", None)
         self.output_logits = kwargs.pop("output_logits", None)
-        self.return_dict_in_generate = kwargs.pop("return_dict_in_generate", False)
+        self.return_dict_in_generate = kwargs.pop("return_dict_in_generate", None)
 
         # Special tokens that can be used at generation time
         self.pad_token_id = kwargs.pop("pad_token_id", None)
@@ -402,53 +432,62 @@ class GenerationConfig(PushToHubMixin):
         self.eos_token_id = kwargs.pop("eos_token_id", None)
 
         # Generation parameters exclusive to encoder-decoder models
-        self.encoder_no_repeat_ngram_size = kwargs.pop("encoder_no_repeat_ngram_size", 0)
+        self.encoder_no_repeat_ngram_size = kwargs.pop("encoder_no_repeat_ngram_size", None)
         self.decoder_start_token_id = kwargs.pop("decoder_start_token_id", None)
 
         # Assistant generation
-        self.is_assistant = False
-        self.num_assistant_tokens = kwargs.pop("num_assistant_tokens", 20)
-        self.num_assistant_tokens_schedule = kwargs.pop("num_assistant_tokens_schedule", "constant")
-        self.assistant_confidence_threshold = kwargs.pop("assistant_confidence_threshold", 0.4)
+        self.is_assistant = kwargs.pop("is_assistant", None)
+        self.num_assistant_tokens = kwargs.pop("num_assistant_tokens", None)
+        self.num_assistant_tokens_schedule = kwargs.pop("num_assistant_tokens_schedule", None)
+        self.assistant_confidence_threshold = kwargs.pop("assistant_confidence_threshold", None)
         self.prompt_lookup_num_tokens = kwargs.pop("prompt_lookup_num_tokens", None)
         self.max_matching_ngram_size = kwargs.pop("max_matching_ngram_size", None)
         self.assistant_early_exit = kwargs.pop("assistant_early_exit", None)
-        ## assistant generation for different tokenizers, the windows size for assistant/target model
-        self.assistant_lookbehind = kwargs.pop("assistant_lookbehind", 10)
-        self.target_lookbehind = kwargs.pop("target_lookbehind", 10)
+        self.assistant_lookbehind = kwargs.pop("assistant_lookbehind", None)
+        self.target_lookbehind = kwargs.pop("target_lookbehind", None)
 
         # Performance
         self.compile_config = kwargs.pop("compile_config", None)
-        self.disable_compile = kwargs.pop("disable_compile", False)
+        self.disable_compile = kwargs.pop("disable_compile", None)
 
-        # Deprecated (moved to the Hub). TODO joao, manuel: remove in v4.62.0
+        self.continuous_batching_config = kwargs.pop("continuous_batching_config", None)
+
+        # Deprecated (moved to the Hub). TODO remove for v5
         self.low_memory = kwargs.pop("low_memory", None)
         self.penalty_alpha = kwargs.pop("penalty_alpha", None)
         self.dola_layers = kwargs.pop("dola_layers", None)
-        self.diversity_penalty = kwargs.pop("diversity_penalty", 0.0)
-        self.num_beam_groups = kwargs.pop("num_beam_groups", 1)
+        self.diversity_penalty = kwargs.pop("diversity_penalty", None)
+        self.num_beam_groups = kwargs.pop("num_beam_groups", None)
         self.constraints = kwargs.pop("constraints", None)
         self.force_words_ids = kwargs.pop("force_words_ids", None)
 
-        # The remaining attributes do not parametrize `.generate()`, but are informative and/or used by the hub
-        # interface.
-        self._from_model_config = kwargs.pop("_from_model_config", False)
+        self.prefill_chunk_size = kwargs.pop("prefill_chunk_size", None)
+
+        # Common attributes
         self._commit_hash = kwargs.pop("_commit_hash", None)
-        self.transformers_version = kwargs.pop("transformers_version", __version__)
+        self._from_model_config = kwargs.pop("_from_model_config", None)
+        self.transformers_version = kwargs.pop("transformers_version", None)
 
         # Additional attributes without default values
         if not self._from_model_config:
-            # we don't want to copy values from the model config if we're initializing a `GenerationConfig` from a
-            # model's default configuration file
+            # we don't want to copy values from the model config if we're initializing
+            # a `GenerationConfig` from a model's default configuration file
             for key, value in kwargs.items():
                 try:
                     setattr(self, key, value)
                 except AttributeError as err:
                     logger.error(f"Can't set {key} with value {value} for {self}")
                     raise err
+        else:
+            # Ensure backward compatibility for models that use `forced_bos_token_id` within their config
+            if kwargs.get("force_bos_token_to_be_generated", False):
+                self.forced_bos_token_id = self.bos_token_id
+                logger.warning_once(
+                    f"Please make sure the generation config includes `forced_bos_token_id={self.bos_token_id}`. "
+                )
 
         # Validate the values of the attributes
-        self.validate()
+        self.validate(user_set_attributes=user_set_attributes)
 
     def __hash__(self):
         return hash(self.to_json_string(ignore_metadata=True))
@@ -480,8 +519,8 @@ class GenerationConfig(PushToHubMixin):
         # property and part of the `__repr__`
         if self.constraints is not None or self.force_words_ids is not None:
             generation_mode = GenerationMode.CONSTRAINED_BEAM_SEARCH
-        elif self.num_beams == 1:
-            if self.do_sample is False:
+        elif self.num_beams is None or self.num_beams == 1:
+            if self.do_sample is not True:
                 if (
                     self.top_k is not None
                     and self.top_k > 1
@@ -494,7 +533,7 @@ class GenerationConfig(PushToHubMixin):
             else:
                 generation_mode = GenerationMode.SAMPLE
         else:
-            if self.num_beam_groups > 1:
+            if self.num_beam_groups is not None and self.num_beam_groups > 1:
                 generation_mode = GenerationMode.GROUP_BEAM_SEARCH
             elif self.do_sample is True:
                 generation_mode = GenerationMode.BEAM_SAMPLE
@@ -529,7 +568,54 @@ class GenerationConfig(PushToHubMixin):
                 )
         return generation_mode
 
-    def validate(self, strict=False):
+    @staticmethod
+    def _get_default_generation_params() -> dict[str, Any]:
+        """
+        Defaults to be applied when unset by the model OR by the user, such that `model.generate()` works with minimal
+        paremeterization.
+
+        Pretrained checkpoints should set these as appropriate in their `generation_config.json`, to establish
+        a better default baseline. Be mindful that tests will often use these values.
+        """
+        return {
+            "max_length": 20,
+            "min_length": 0,
+            "do_sample": False,
+            "use_cache": True,
+            "early_stopping": False,
+            "num_beams": 1,
+            "temperature": 1.0,
+            "top_k": 50,
+            "top_p": 1.0,
+            "typical_p": 1.0,
+            "repetition_penalty": 1.0,
+            "length_penalty": 1.0,
+            "no_repeat_ngram_size": 0,
+            "encoder_no_repeat_ngram_size": 0,
+            "bad_words_ids": None,
+            "num_return_sequences": 1,
+            "output_scores": False,
+            "return_dict_in_generate": False,
+            "forced_bos_token_id": None,
+            "forced_eos_token_id": None,
+            "remove_invalid_values": False,
+            "exponential_decay_length_penalty": None,
+            "suppress_tokens": None,
+            "begin_suppress_tokens": None,
+            "epsilon_cutoff": 0.0,
+            "eta_cutoff": 0.0,
+            "encoder_repetition_penalty": 1.0,
+            "num_assistant_tokens": 20,
+            "num_assistant_tokens_schedule": "constant",
+            "assistant_confidence_threshold": 0.4,
+            "assistant_lookbehind": 10,
+            "target_lookbehind": 10,
+            # Deprecated arguments (moved to the Hub). TODO joao, manuel: remove in v4.62.0
+            "num_beam_groups": 1,
+            "diversity_penalty": 0.0,
+        }
+
+    def validate(self, strict=False, user_set_attributes: set[str] | None = None):
         """
         Validates the values of the attributes of the [`GenerationConfig`] instance. Raises exceptions in the presence
         of parameterization that can be detected as incorrect from the configuration instance alone.
@@ -539,12 +625,17 @@ class GenerationConfig(PushToHubMixin):
 
         Args:
             strict (bool): If True, raise an exception for any issues found. If False, only log issues.
+            user_set_attributes (set[str], *optional*): Names of attributes the caller explicitly provided. When
+                supplied, "minor issue" warnings about conflicting flag combinations (e.g. sampling-only flags set
+                while `do_sample=False`) only fire if the conflicting flag is in this set -- avoiding noisy warnings
+                when the value was inherited from a model's default `generation_config.json`. When `None`, all set
+                attributes are considered user-set (backward-compatible behavior for direct `validate()` calls).
         """
         minor_issues = {}  # format: {attribute_name: issue_description}
 
         # 1. Validation of individual attributes
         # 1.1. Decoding attributes
-        if self.early_stopping not in {True, False, "never"}:
+        if self.early_stopping not in {None, True, False, "never"}:
             raise ValueError(f"`early_stopping` must be a boolean or 'never', but is {self.early_stopping}.")
         if self.max_new_tokens is not None and self.max_new_tokens <= 0:
             raise ValueError(f"`max_new_tokens` must be greater than 0, but is {self.max_new_tokens}.")
@@ -575,60 +666,99 @@ class GenerationConfig(PushToHubMixin):
 
         # 2. Validation of attribute combinations
         # 2.1. detect sampling-only parameterization when not in sampling mode
-        if self.do_sample is False:
+
+        # Note that we check `is not True` in purpose. Boolean fields can also be `None` so we
+        # have to be explicit. Value of `None` is same as having `False`, i.e. the default value
+
+        if self.do_sample is not True:
             greedy_wrong_parameter_msg = (
-                "`do_sample` is set to `False`. However, `{flag_name}` is set to `{flag_value}` -- this flag is only "
-                "used in sample-based generation modes. You should set `do_sample=True` or unset `{flag_name}`."
+                "`do_sample` is not set to `True`. However, `{flag_name}` is set to `{flag_value}` -- this flag is "
+                "only used in sample-based generation modes. You should set `do_sample=True` or unset `{flag_name}`."
             )
-            if self.temperature is not None and self.temperature != 1.0:
+
+            if (
+                self.temperature is not None
+                and self.temperature != 1.0
+                and _should_warn("do_sample", "temperature", user_set_attributes)
+            ):
                 minor_issues["temperature"] = greedy_wrong_parameter_msg.format(
                     flag_name="temperature", flag_value=self.temperature
                 )
-            if self.top_p is not None and self.top_p != 1.0:
+            if (
+                self.top_p is not None
+                and self.top_p != 1.0
+                and _should_warn("do_sample", "top_p", user_set_attributes)
+            ):
                 minor_issues["top_p"] = greedy_wrong_parameter_msg.format(flag_name="top_p", flag_value=self.top_p)
-            if self.min_p is not None:
+            if self.min_p is not None and _should_warn("do_sample", "min_p", user_set_attributes):
                 minor_issues["min_p"] = greedy_wrong_parameter_msg.format(flag_name="min_p", flag_value=self.min_p)
-            if self.top_h is not None:
+            if self.top_h is not None and _should_warn("do_sample", "top_h", user_set_attributes):
                 minor_issues["top_h"] = greedy_wrong_parameter_msg.format(flag_name="top_h", flag_value=self.top_h)
-            if self.typical_p is not None and self.typical_p != 1.0:
+            if (
+                self.typical_p is not None
+                and self.typical_p != 1.0
+                and _should_warn("do_sample", "typical_p", user_set_attributes)
+            ):
                 minor_issues["typical_p"] = greedy_wrong_parameter_msg.format(
                     flag_name="typical_p", flag_value=self.typical_p
                 )
-            if self.top_k is not None and self.top_k != 50:
+            if self.top_k is not None and self.top_k != 50 and _should_warn("do_sample", "top_k", user_set_attributes):
                 minor_issues["top_k"] = greedy_wrong_parameter_msg.format(flag_name="top_k", flag_value=self.top_k)
-            if self.epsilon_cutoff is not None and self.epsilon_cutoff != 0.0:
+            if (
+                self.epsilon_cutoff is not None
+                and self.epsilon_cutoff != 0.0
+                and _should_warn("do_sample", "epsilon_cutoff", user_set_attributes)
+            ):
                 minor_issues["epsilon_cutoff"] = greedy_wrong_parameter_msg.format(
                     flag_name="epsilon_cutoff", flag_value=self.epsilon_cutoff
                 )
-            if self.eta_cutoff is not None and self.eta_cutoff != 0.0:
+            if (
+                self.eta_cutoff is not None
+                and self.eta_cutoff != 0.0
+                and _should_warn("do_sample", "eta_cutoff", user_set_attributes)
+            ):
                 minor_issues["eta_cutoff"] = greedy_wrong_parameter_msg.format(
                     flag_name="eta_cutoff", flag_value=self.eta_cutoff
                 )
 
-        # 2.2. detect beam-only parameterization when not in beam mode
-        if self.num_beams == 1:
+        # 2.2. detect beam-only parameterization when not in beam mode. Same provenance filtering as above --
+        # both `num_beams` and the beam-only flag must be user-set for the warning to fire.
+        if self.num_beams is None or self.num_beams == 1:
             single_beam_wrong_parameter_msg = (
-                "`num_beams` is set to 1. However, `{flag_name}` is set to `{flag_value}` -- this flag is only used "
-                "in beam-based generation modes. You should set `num_beams>1` or unset `{flag_name}`."
+                "`num_beams` is set to {num_beams}. However, `{flag_name}` is set to `{flag_value}` -- this flag is "
+                "only used in beam-based generation modes. You should set `num_beams>1` or unset `{flag_name}`."
             )
-            if self.early_stopping is not False:
+
+            if (
+                self.early_stopping is not None
+                and self.early_stopping is not False
+                and _should_warn("num_beams", "early_stopping", user_set_attributes)
+            ):
                 minor_issues["early_stopping"] = single_beam_wrong_parameter_msg.format(
-                    flag_name="early_stopping", flag_value=self.early_stopping
+                    num_beams=self.num_beams, flag_name="early_stopping", flag_value=self.early_stopping
                 )
-            if self.length_penalty is not None and self.length_penalty != 1.0:
+            if (
+                self.length_penalty is not None
+                and self.length_penalty != 1.0
+                and _should_warn("num_beams", "length_penalty", user_set_attributes)
+            ):
                 minor_issues["length_penalty"] = single_beam_wrong_parameter_msg.format(
-                    flag_name="length_penalty", flag_value=self.length_penalty
+                    num_beams=self.num_beams, flag_name="length_penalty", flag_value=self.length_penalty
                 )
 
         # 2.4. check `num_return_sequences`
-        if self.num_return_sequences != 1:
-            if self.num_beams == 1:
-                if self.do_sample is False:
+        if self.num_return_sequences is not None and self.num_return_sequences > 1:
+            if self.num_beams is None or self.num_beams == 1:
+                if not self.do_sample:
                     raise ValueError(
-                        "Greedy methods without beam search do not support `num_return_sequences` different than 1 "
-                        f"(got {self.num_return_sequences})."
+                        "Greedy methods (do_sample != True) without beam search do not support "
+                        f"`num_return_sequences` different than 1 (got {self.num_return_sequences})."
                     )
-            elif self.num_return_sequences > self.num_beams:
+            elif (
+                self.num_beams is not None
+                and self.num_return_sequences is not None
+                and self.num_return_sequences > self.num_beams
+            ):
                 raise ValueError(
                     f"`num_return_sequences` ({self.num_return_sequences}) has to be smaller or equal to `num_beams` "
                     f"({self.num_beams})."
@@ -640,8 +770,8 @@ class GenerationConfig(PushToHubMixin):
             # passed to `generate` directly to hot-fix cache issues, let's raise a warning instead of an error
             # (otherwise a user might need to overwrite several parameters).
             no_cache_warning = (
-                "You have set `use_cache` to `False`, but {cache_arg} is set to {cache_arg_value}. {cache_arg} will "
-                "have no effect."
+                "You have not set `use_cache` to `True`, but {cache_arg} is set to {cache_arg_value}."
+                "{cache_arg} will have no effect."
             )
             for arg_name in ("cache_implementation", "cache_config"):
                 if getattr(self, arg_name) is not None:
@@ -668,7 +798,6 @@ class GenerationConfig(PushToHubMixin):
             "streamer",
             "negative_prompt_ids",
             "negative_prompt_attention_mask",
-            "use_model_defaults",
         )
         for arg in generate_arguments:
             if hasattr(self, arg):
@@ -703,8 +832,8 @@ class GenerationConfig(PushToHubMixin):
 
     def save_pretrained(
         self,
-        save_directory: Union[str, os.PathLike],
-        config_file_name: Optional[Union[str, os.PathLike]] = None,
+        save_directory: str | os.PathLike,
+        config_file_name: str | os.PathLike | None = None,
         push_to_hub: bool = False,
         **kwargs,
     ):
@@ -742,13 +871,13 @@ class GenerationConfig(PushToHubMixin):
 
         if push_to_hub:
             commit_message = kwargs.pop("commit_message", None)
-            repo_id = kwargs.pop("repo_id", save_directory.split(os.path.sep)[-1])
-            repo_id = self._create_repo(repo_id, **kwargs)
+            repo_id = kwargs.pop("repo_id", str(save_directory).split(os.path.sep)[-1])
+            repo_id = hf_api().create_repo(repo_id, exist_ok=True, **kwargs).repo_id
             files_timestamps = self._get_files_timestamps(save_directory)
 
         output_config_file = os.path.join(save_directory, config_file_name)
 
-        self.to_json_file(output_config_file, use_diff=True)
+        self.to_json_file(output_config_file, use_diff=True, keys_to_pop=["compile_config"])
         logger.info(f"Configuration saved in {output_config_file}")
 
         if push_to_hub:
@@ -763,12 +892,12 @@ class GenerationConfig(PushToHubMixin):
     @classmethod
     def from_pretrained(
         cls,
-        pretrained_model_name: Union[str, os.PathLike],
-        config_file_name: Optional[Union[str, os.PathLike]] = None,
-        cache_dir: Optional[Union[str, os.PathLike]] = None,
+        pretrained_model_name: str | os.PathLike,
+        config_file_name: str | os.PathLike | None = None,
+        cache_dir: str | os.PathLike | None = None,
         force_download: bool = False,
         local_files_only: bool = False,
-        token: Optional[Union[str, bool]] = None,
+        token: str | bool | None = None,
         revision: str = "main",
         **kwargs,
     ) -> "GenerationConfig":
@@ -872,9 +1001,6 @@ class GenerationConfig(PushToHubMixin):
             # Special case when config_path is a local file
             resolved_config_file = config_path
             is_local = True
-        elif is_remote_url(config_path):
-            configuration_file = config_path
-            resolved_config_file = download_url(config_path)
         else:
             configuration_file = config_file_name
             try:
@@ -918,7 +1044,9 @@ class GenerationConfig(PushToHubMixin):
         else:
             logger.info(f"loading configuration file {configuration_file} from cache at {resolved_config_file}")
 
-        if kwargs.get("return_unused_kwargs") is True:
+        if kwargs.get("_from_model_config", False):
+            return cls.from_model_config(config_dict)
+        elif kwargs.get("return_unused_kwargs") is True:
             config, unused_kwargs = cls.from_dict(config_dict, **kwargs)
             config._original_object_hash = hash(config)  # Hash to detect whether the instance was modified
             return config, unused_kwargs
@@ -928,7 +1056,7 @@ class GenerationConfig(PushToHubMixin):
             return config
 
     @classmethod
-    def _dict_from_json_file(cls, json_file: Union[str, os.PathLike]):
+    def _dict_from_json_file(cls, json_file: str | os.PathLike):
         with open(json_file, "r", encoding="utf-8") as reader:
             text = reader.read()
         return json.loads(text)
@@ -1016,8 +1144,6 @@ class GenerationConfig(PushToHubMixin):
             del output["_commit_hash"]
         if "_original_object_hash" in output:
             del output["_original_object_hash"]
-        if "compile_config" in output:
-            del output["compile_config"]
 
         # Transformers version when serializing this file
         output["transformers_version"] = __version__
@@ -1025,7 +1151,9 @@ class GenerationConfig(PushToHubMixin):
         self.dict_dtype_to_str(output)
         return output
 
-    def to_json_string(self, use_diff: bool = True, ignore_metadata: bool = False) -> str:
+    def to_json_string(
+        self, use_diff: bool = True, ignore_metadata: bool = False, keys_to_pop: list[str] | None = None
+    ) -> str:
         """
         Serializes this instance to a JSON string.
 
@@ -1035,6 +1163,8 @@ class GenerationConfig(PushToHubMixin):
                 is serialized to JSON string.
             ignore_metadata (`bool`, *optional*, defaults to `False`):
                 Whether to ignore the metadata fields present in the instance
+            keys_to_pop (`list[str]`, *optional*):
+                Keys to pop from the config dictionary before serializing
 
         Returns:
             `str`: String containing all the attributes that make up this configuration instance in JSON format.
@@ -1043,6 +1173,10 @@ class GenerationConfig(PushToHubMixin):
             config_dict = self.to_diff_dict()
         else:
             config_dict = self.to_dict()
+
+        if keys_to_pop is not None:
+            for key in keys_to_pop:
+                config_dict.pop(key, None)
 
         if ignore_metadata:
             for metadata_field in METADATA_FIELDS:
@@ -1060,7 +1194,9 @@ class GenerationConfig(PushToHubMixin):
             if isinstance(obj, dict):
                 return {key: convert_dataclass_to_dict(value) for key, value in obj.items()}
             elif is_dataclass(obj):
-                return obj.to_dict()
+                # Some of our dataclasses have a custom `to_dict()` method, and we prefer it
+                if hasattr(obj, "to_dict"):
+                    return obj.to_dict()
             else:
                 return obj
 
@@ -1069,7 +1205,9 @@ class GenerationConfig(PushToHubMixin):
 
         return json.dumps(config_dict, indent=2, sort_keys=True) + "\n"
 
-    def to_json_file(self, json_file_path: Union[str, os.PathLike], use_diff: bool = True):
+    def to_json_file(
+        self, json_file_path: str | os.PathLike, use_diff: bool = True, keys_to_pop: list[str] | None = None
+    ) -> None:
         """
         Save this instance to a JSON file.
 
@@ -1079,44 +1217,52 @@ class GenerationConfig(PushToHubMixin):
             use_diff (`bool`, *optional*, defaults to `True`):
                 If set to `True`, only the difference between the config instance and the default `GenerationConfig()`
                 is serialized to JSON file.
+            keys_to_pop (`list[str]`, *optional*):
+                Keys to pop from the config dictionary before serializing
         """
         with open(json_file_path, "w", encoding="utf-8") as writer:
-            writer.write(self.to_json_string(use_diff=use_diff))
+            writer.write(self.to_json_string(use_diff=use_diff, keys_to_pop=keys_to_pop))
 
     @classmethod
-    def from_model_config(cls, model_config: PreTrainedConfig) -> "GenerationConfig":
+    def from_model_config(cls, model_config: Union["PreTrainedConfig", dict]) -> "GenerationConfig":
         """
         Instantiates a [`GenerationConfig`] from a [`PreTrainedConfig`]. This function is useful to convert legacy
         [`PreTrainedConfig`] objects, which may contain generation parameters, into a stand-alone [`GenerationConfig`].
 
         Args:
-            model_config (`PreTrainedConfig`):
+            model_config (`PreTrainedConfig | dict`):
                 The model config that will be used to instantiate the generation config.
 
         Returns:
             [`GenerationConfig`]: The configuration object instantiated from those parameters.
         """
-        config_dict = model_config.to_dict()
+        config_dict = model_config.to_dict() if not isinstance(model_config, dict) else model_config
         config_dict.pop("_from_model_config", None)
 
         # Removes all `None` from the model config dict -- this lets the generation config defaults to take hold
         config_dict = {key: value for key, value in config_dict.items() if value is not None}
-
         generation_config = cls.from_dict(config_dict, return_unused_kwargs=False, _from_model_config=True)
 
         # Special case: some models have generation attributes set in the decoder. Use them if still unset in the
         # generation config (which in turn is defined from the outer attributes of model config).
-        decoder_config = model_config.get_text_config(decoder=True)
-        if decoder_config is not model_config:
-            default_generation_config = GenerationConfig()
-            decoder_config_dict = decoder_config.to_dict()
-            for attr in generation_config.to_dict():
-                is_unset = getattr(generation_config, attr) == getattr(default_generation_config, attr)
-                if attr in decoder_config_dict and is_unset:
-                    setattr(generation_config, attr, decoder_config_dict[attr])
+        if isinstance(model_config, dict):
+            decoder_possible_text_config_names = ("decoder", "generator", "text_config")
+            for text_config_name in decoder_possible_text_config_names:
+                if text_config := model_config.get(text_config_name):
+                    model_config = text_config
+                    break
+        else:
+            model_config = model_config.get_text_config(decoder=True)
+            model_config = model_config.to_dict()
+
+        default_generation_config = GenerationConfig()
+        for attr in generation_config.to_dict():
+            is_unset = getattr(generation_config, attr) == getattr(default_generation_config, attr)
+            if attr in model_config and is_unset:
+                setattr(generation_config, attr, model_config[attr])
 
         # If any `output_...` flag is set to `True`, we ensure `return_dict_in_generate` is set to `True`.
-        if generation_config.return_dict_in_generate is False:
+        if not generation_config.return_dict_in_generate:
             if any(
                 getattr(generation_config, extra_output_flag, False)
                 for extra_output_flag in generation_config.extra_output_flags
@@ -1127,12 +1273,16 @@ class GenerationConfig(PushToHubMixin):
         generation_config._original_object_hash = hash(generation_config)
         return generation_config
 
-    def update(self, **kwargs):
+    def update(self, defaults_only=False, allow_custom_entries=False, **kwargs):
         """
         Updates attributes of this class instance with attributes from `kwargs` if they match existing attributes,
         returning all the unused kwargs.
 
         Args:
+            defaults_only (`bool`, *optional*, defaults to `False`):
+                Whether to update all keys in config with `kwargs` or only those that are set to `None` (i.e. default value).
+            allow_custom_entries (`bool`, *optional*, defaults to `False`):
+                Whether to allow updating custom entries into the config with `kwargs` if not present in the current config.
             kwargs (`dict[str, Any]`):
                 Dictionary of attributes to tentatively update this class.
 
@@ -1141,12 +1291,17 @@ class GenerationConfig(PushToHubMixin):
         """
         to_remove = []
         for key, value in kwargs.items():
-            if hasattr(self, key):
+            if allow_custom_entries and not hasattr(self, key):
                 setattr(self, key, value)
                 to_remove.append(key)
+            elif hasattr(self, key):
+                if not defaults_only or getattr(self, key) is None:
+                    setattr(self, key, value)
+                    to_remove.append(key)
 
-        # Confirm that the updated instance is still valid
-        self.validate()
+        # Confirm that the updated instance is still valid. Only attributes *explicitly* updated in this call count
+        # as user-set for warning purposes: defaults inherited from a model's config shouldn't emit warnings.
+        self.validate(user_set_attributes=set(to_remove))
 
         # Remove all the attributes that were updated, without modifying the input dict
         unused_kwargs = {key: value for key, value in kwargs.items() if key not in to_remove}
@@ -1179,7 +1334,7 @@ class BaseWatermarkingConfig(ABC):
             kwargs.pop(key, None)
         return config
 
-    def to_json_file(self, json_file_path: Union[str, os.PathLike]):
+    def to_json_file(self, json_file_path: str | os.PathLike):
         """
         Save this instance to a JSON file.
 
@@ -1203,8 +1358,7 @@ class BaseWatermarkingConfig(ABC):
         return output
 
     def __iter__(self):
-        for attr, value in copy.deepcopy(self.__dict__).items():
-            yield attr, value
+        yield from copy.deepcopy(self.__dict__).items()
 
     def __repr__(self):
         return f"{self.__class__.__name__} {self.to_json_string()}"
@@ -1412,7 +1566,7 @@ class CompileConfig:
 
     Args:
         fullgraph (`bool`, *optional*, defaults to `False`):
-            If False (default), attempts to discover compileable regions that will be optimized. If True, then require
+            If False (default), attempts to discover compilable regions that will be optimized. If True, then require
             that the entire function be capturable into a single graph. If this is not possible (that is, if there are
             graph breaks), then an error will be raised.
         dynamic (`bool` or `None`, *optional*):
@@ -1444,13 +1598,225 @@ class CompileConfig:
     """
 
     fullgraph: bool = False
-    dynamic: Optional[bool] = None
-    backend: Union[str, Callable] = "inductor"
+    dynamic: bool | None = None
+    backend: str | Callable = "inductor"
     mode: str = "reduce-overhead"
-    options: Optional[dict] = None
+    options: dict | None = None
     # Used to flag our `generate` call to compile on e.g. CPU. Often not optimal, but useful for testing purposes.
     _compile_all_devices = None
 
     def to_dict(self) -> dict[str, Any]:
         """Serializes this instance to a Python dictionary."""
         return copy.deepcopy({key: value for key, value in self.__dict__.items() if key != "_compile_all_devices"})
+
+
+# TODO: add the @strict decorator to prevent attributes passed as args rather than kwargs
+@dataclass
+class ContinuousBatchingConfig:
+    """
+    Class that holds arguments relative to continuous batching, when using continuous batching through the
+    `generate_batch` method or the `continuous_batching_context_manager` context manager.
+
+    Args:
+        block_size (`int`, *optional*, defaults to 256):
+            Size of each KV cache block in tokens.
+        num_blocks (`int`, *optional*):
+            Number of blocks in the KV cache. Auto-inferred from GPU memory when `None`.
+        max_batch_tokens (`int`, *optional*):
+            Maximum number of tokens in a batch. Auto-inferred from GPU memory when `None`.
+        max_memory_percent (`float`, *optional*):
+            Maximum percentage of free GPU memory (after the model is loaded) to use for the KV cache. When `None`,
+            resolved at runtime to 0.9 if there is no logit processing and 0.8 if there is, to leave headroom for
+            vocabulary-sized temporary tensors.
+        max_requests_per_batch (`int`, *optional*):
+            Maximum number of requests per batch. Auto-inferred from workload hints when `None`, with fallback of 1024.
+        max_blocks_per_request (`int`, *optional*):
+            Maximum blocks per request, used in the `flash_attn_with_kvcache` fast decode path to dimension
+            the block table. Setting this to 0 disables the fast decode path. Default is None (auto-inferred).
+        allow_block_sharing (`bool`, *optional*, defaults to `True`):
+            Whether to allow block sharing for prefix caching. Block sharing can only be allowed, never forced,
+            as some models do not support it. Disable if you have few short prompts but long generation lengths.
+        use_async_batching (`bool`, *optional*):
+            Whether to enable async double-buffering, which removes CPU overhead from the continuous batching
+            loop at the cost of doubled VRAM usage. Auto-detected when `None`.
+        use_cuda_graph (`bool` or `tuple[bool, bool]`, *optional*):
+            Whether to enable CUDA graphs. This can be a tuple of booleans (one for the varlen path and one for the
+            decode fast path), a boolean which will apply to both paths, or None (automatically inferred). After calling
+            `decide_use_cuda_graphs`, the attribute will be a tuple of booleans. Default is None (automatically inferred).
+        q_padding_interval_size (`int`, *optional*, defaults to 0):
+            Query padding granularity in tokens for CUDA graphs. Uses a preset from `continuous_api.py` when
+            set to 0.
+        kv_padding_interval_size (`int`, *optional*, defaults to 0):
+            KV padding granularity in tokens for CUDA graphs. Uses a preset from `continuous_api.py` when
+            set to 0.
+        max_cached_graphs (`int`, *optional*, defaults to 0):
+            Maximum number of cached CUDA graphs. Uses a preset from `continuous_api.py` when set to 0.
+        varlen_compile_config (`CompileConfig`, *optional*):
+            CompileConfig for varlen (prefill) path. Default is None (uses generation_config fallback)
+            The varlen path handles batches with varying query and KV lengths, often benefiting from dynamic=True.
+        decode_compile_config (`CompileConfig`, *optional*):
+            CompileConfig for decode (fast) path. Default is None (uses generation_config fallback)
+            The decode path handles batches has no dynamic KV length, so static shapes are a better fit.
+        default_compile_level (`int`, *optional*, defaults to 0):
+            If this is >0 and no compile config is provided for varlen or decode path, a default compile config will be
+            provided. The level can go up to 3, and a higher level means more performance but longer warmup time.
+        scheduler_type (`str`, *optional*, defaults to `"fifo"`):
+            Scheduler type to use.
+        safety_margin (`float`, *optional*):
+            Safety margin used to limit the amount of offloading. Defaults to None (use class default).
+        return_logprobs (`bool`, *optional*, defaults to `False`):
+            Whether to return log probabilities along with the generated tokens.
+        seed (`int | None`, *optional*):
+            An optional seed for generation. If not specified, the internal seed will be set to a random value.
+        cpu_offload_space (`float`, *optional*, defaults to 0.0):
+            CPU swap space in GiB for KV cache offloading. A pre-allocated pinned CPU buffer of this size is
+            created at initialization. When the GPU cache is full, evicted requests' KV caches are copied here
+            instead of being discarded. 0 disables offloading (default).
+        cpu_offload_space_safety_threshold (`float`, *optional*, defaults to 0.8):
+            If `cpu_offload_space` exceeds this fraction of total system RAM, it is clamped to avoid host OOM.
+            Set to 1.0 to disable the safety cap. Ignored when psutil is not available.
+        max_queue_size (`int`, *optional*, defaults to 0):
+            Maximum request queue size for serving. 0 means unlimited.
+        per_request_processors (`bool`, *optional*, defaults to `False`):
+            Enable per-request logits processor parameters. Default is False.
+        drop_unsupported_processors (`bool`, *optional*, defaults to `True`):
+            Remove unsupported logits processors instead of erroring. Default is True.
+        disable_nccl_graph_mixing (`bool`, *optional*, defaults to `True`):
+            Disable NCCL's safety net for parallel graph-captured comms. Never happens in CB and gives TP a perf boost.
+        cpu_group_timeout (`float`, *optional*, defaults to 300.0):
+            The time (in seconds) after which a CPU communication will timeout and the process will crash. Leave to None
+            for no timeout. Default is 300 seconds.
+        use_default_compile_configs (`bool | None`, *optional*):
+            Deprecated in 5.11: please use default_compile_level instead.
+    """
+
+    # Size of each KV cache block
+    block_size: int = 256
+
+    # The number of blocks used in the KV cache and the maximum number of tokens in a batch. Once the block size is set,
+    # these can be auto inferred using GPU size.
+    num_blocks: int | None = None
+    max_batch_tokens: int | None = None
+
+    # The max percentage of free GPU memory (after the model is loaded) to use for the KV cache. If None, auto resolved
+    # to 0.9 (no logit processing) or 0.8 (logit processing) to leave headroom for temporary tensors.
+    max_memory_percent: float | None = None
+
+    # The maximum number of requests in a batch. Helps limiting the memory footprint of the logits, which scale with the
+    # vocabulary size.
+    max_requests_per_batch: int | None = None
+
+    # This is only used in the flash_attn_with_kvcache fast decode path to dimension the block table. If it is set to 0,
+    # the fast decode path will not be used. Auto-inferred from GPU memory when `None` (default).
+    max_blocks_per_request: int | None = None
+
+    # Block sharing can only be allowed, but never forced: some model just do not support it. If you only have a few
+    # short prompts, but long generation lengths, you might want to disable block sharing.
+    allow_block_sharing: bool = True
+
+    # Enables asynchronous batching. This removes the CPU overhead from the continuous batching loop, at the cost of
+    # doubling the VRAM usage. If None, will be automatically detected.
+    use_async_batching: bool | None = None
+
+    # Enables cuda graphs. This can be a tuple of booleans (one for the varlen path and one for the decode fast path), a
+    # boolean which will apply to both paths, or None (automatically inferred). After calling `decide_use_cuda_graphs`,
+    # the attribute will ALWAYS be a tuple of booleans.
+    use_cuda_graph: bool | tuple[bool, bool] | None = None
+
+    # If any of these parameters are set to a non-default, CUDA graphs will be used. Otherwise we automatically infer
+    # if they should be turned on. Padding interval sizes are in tokens and further explained in the docstring at the
+    # top of the continuous_batching/continuous_api.py file.
+    q_padding_interval_size: int = 0
+    kv_padding_interval_size: int = 0
+    max_cached_graphs: int = 0
+
+    # Compile configs for the two execution paths. If None, uses the compile_config from generation_config as fallback.
+    varlen_compile_config: CompileConfig | None = None
+    decode_compile_config: CompileConfig | None = None
+    # Compile level for the executions path, if no compile config is provided for the path. Default is 0 (no compile).
+    # Level 1: `mode=default, dynamic=True`
+    # Level 2: `mode=max-autotune-no-cudagraphs, dynamic=True`
+    # Level 3: `mode=max-autotune-no-cudagraphs, dynamic=False`
+    default_compile_level: int = 0
+
+    # Scheduler type. FIFO by default. For all types available, checks SCHEDULER_MAPPING in scheduler.py
+    scheduler_type: str = "fifo"
+    # Safety margin: if the number of free blocks falls below (safety_margin * num_blocks), then new prefill requests
+    # will not be scheduled to prioritize decoding active requests. Defaults to None (use class default).
+    safety_margin: float | None = None
+
+    # Whether to generate log probabilities, which is the log of the softmax of the processed logits. If True, the log
+    # probabilities will be returned along with the generated tokens in the generation output.
+    return_logprobs: bool = False
+
+    # An optional seed for generation. If not specified, the internal seed will be set to a random value.
+    seed: int | None = None
+
+    # CPU swap space in GiB for KV cache offloading. When the GPU cache is full and a request must be evicted, its KV
+    # cache is copied to this pre-allocated pinned CPU buffer instead of being discarded. Default to 0.0 GiB. You can
+    # also set this to None to dimension the pool using only the safety threshold, but this will error out if psutil is
+    # not available.
+    # TODO: use async transfer and move this to a non-zero value
+    cpu_offload_space: float | None = 0.0
+    # Safety cap: if cpu_offload_space exceeds this fraction of total system RAM, it is clamped. Set to 0.0 to disable
+    # offloading.
+    cpu_offload_space_safety_threshold: float = 0.8
+
+    # The parameters below are mostly useful in the context of serving
+    max_queue_size: int = 0
+
+    # Enables per-request logits processor parameters. When enabled, each request can specify its own values (e.g.,
+    # temperature) via logits_processor_kwargs. When disabled, all requests use the default values.
+    per_request_processors: bool = False
+    # When True, processors explicitly marked as unsupported are removed with a warning. When False, all processors
+    # are kept but warnings are logged for unsupported/unknown ones.
+    drop_unsupported_processors: bool = True
+
+    # Disable NCCL's safety net for parallel graph-captured communications. This means it is no longer safe to replay a
+    # CUDA graph with NCCL communication at the same time as 1. another CUDA graph with captured comms 2. an eager comm.
+    # This is turned on by default because the above never happens in CB and this gives a nice perf boost.
+    disable_nccl_graph_mixing: bool = True
+
+    # The time (in seconds) after which a CPU communication will timeout and the process will crash. Leave to None for
+    # no timeout. Default is 300 seconds. This exists because dist has a gloo timeout of 30 minutes, which is way too
+    # long for almost all use cases.
+    cpu_group_timeout: float | None = 300.0
+
+    # Deprecated arguments
+    use_default_compile_configs: bool | None = None
+
+    def __post_init__(self):
+        # Only turn off graph mixing support if TP is on
+        graph_mixing_supported = os.environ.get("NCCL_GRAPH_MIXING_SUPPORT", "1") == "1"
+        distributed = int(os.environ.get("WORLD_SIZE", "1")) > 1
+        if self.disable_nccl_graph_mixing and graph_mixing_supported and distributed:
+            logger.warning(
+                "Setting NCCL_GRAPH_MIXING_SUPPORT = 0 because disable_nccl_graph_mixing is True and WORLD_SIZE > 1."
+            )
+            os.environ.setdefault("NCCL_GRAPH_MIXING_SUPPORT", "0")
+        # Warn about deprecated arguments
+        if self.use_default_compile_configs is not None:  # Deprecated in 5.11
+            if self.use_default_compile_configs:
+                level_msg = "setting default_compile_level to 3. Consider using a lower level for faster warmup time."
+                self.default_compile_level = 3
+            else:
+                level_msg = "setting default_compile_level to 0."
+                self.default_compile_level = 0
+            logger.warning(
+                "use_default_compile_configs is deprecated: please use default_compile_level instead. For backwards "
+                f"compatibility, {level_msg}"
+            )
+
+    @property
+    def cuda_graph_booleans(self) -> tuple[bool, bool]:
+        """The cuda graph booleans for the varlen and decode paths."""
+        if self.use_cuda_graph is None:
+            return False, False
+        if isinstance(self.use_cuda_graph, bool):
+            return self.use_cuda_graph, self.use_cuda_graph
+        return self.use_cuda_graph
+
+    @property
+    def fallback_max_blocks_per_request(self) -> int:
+        """Fallback if no user-hint is given and decode path is available."""
+        return 32

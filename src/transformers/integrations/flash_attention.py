@@ -1,5 +1,3 @@
-from typing import Optional
-
 import torch
 
 from ..modeling_flash_attention_utils import _flash_attention_forward, flash_attn_supports_top_left_mask
@@ -14,11 +12,12 @@ _use_top_left_mask = flash_attn_supports_top_left_mask()
 def get_target_dtype(query: torch.Tensor, module: torch.nn.Module) -> torch.dtype:
     """If the query is in float32, return a target dtype compatible with flash attention. Return None otherwise."""
     if query.dtype == torch.float32:
-        if torch.is_autocast_enabled():
-            return torch.get_autocast_gpu_dtype()
+        device_type = query.device.type
+        if torch.is_autocast_enabled(device_type):
+            return torch.get_autocast_dtype(device_type)
         # Handle the case where the model is quantized
-        elif hasattr(module.config, "_pre_quantization_dtype"):
-            return module.config._pre_quantization_dtype
+        elif hasattr(module.config, "_is_quantized"):
+            return module.config.dtype
         else:
             return next(layer for layer in module.modules() if isinstance(layer, torch.nn.Linear)).weight.dtype
     return None
@@ -29,17 +28,18 @@ def flash_attention_forward(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-    attention_mask: Optional[torch.Tensor],
+    attention_mask: torch.Tensor | None,
     dropout: float = 0.0,
-    scaling: Optional[float] = None,
-    sliding_window: Optional[int] = None,
-    softcap: Optional[float] = None,
-    is_causal: Optional[bool] = None,
+    scaling: float | None = None,
+    sliding_window: int | None = None,
+    softcap: float | None = None,
+    is_causal: bool | None = None,
+    s_aux: torch.Tensor | None = None,  # alias: learnable attention sink
     **kwargs,
 ) -> tuple[torch.Tensor, None]:
     if kwargs.get("output_attentions", False):
         logger.warning_once(
-            "`flash_attention_2` does not support `output_attentions=True`."
+            "Flash Attention does not support `output_attentions=True`."
             " Please set your attention to `eager` if you want any of these features."
         )
 
@@ -82,6 +82,11 @@ def flash_attention_forward(
         target_dtype=target_dtype,
         attn_implementation=module.config._attn_implementation,
         layer_idx=module.layer_idx if hasattr(module, "layer_idx") else None,
+        s_aux=(
+            s_aux.to(query.dtype)  # FA only accepts half precision
+            if s_aux is not None
+            else None
+        ),
         **kwargs,
     )
 

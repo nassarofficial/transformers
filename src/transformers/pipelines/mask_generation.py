@@ -231,7 +231,7 @@ class MaskGenerationPipeline(ChunkPipeline):
         for i in range(0, n_points, points_per_batch):
             batched_points = grid_points[:, i : i + points_per_batch, :, :]
             labels = input_labels[:, i : i + points_per_batch]
-            is_last = i == n_points - points_per_batch
+            is_last = i + points_per_batch >= n_points
             yield {
                 "input_points": batched_points,
                 "input_labels": labels,
@@ -253,7 +253,8 @@ class MaskGenerationPipeline(ChunkPipeline):
         input_boxes = model_inputs.pop("input_boxes")
         is_last = model_inputs.pop("is_last")
         original_sizes = model_inputs.pop("original_sizes").tolist()
-        reshaped_input_sizes = model_inputs.pop("reshaped_input_sizes").tolist()
+        reshaped_input_sizes = model_inputs.pop("reshaped_input_sizes", None)
+        reshaped_input_sizes = reshaped_input_sizes.tolist() if reshaped_input_sizes is not None else None
 
         model_outputs = self.model(**model_inputs)
 

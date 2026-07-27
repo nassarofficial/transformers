@@ -74,6 +74,22 @@ class GraniteForDoclingVisionConfig(PreTrainedConfig):
 class GraniteForDoclingTextConfig(PretrainedConfig):
     r"""
     Configuration for the dense Granite-style text decoder used in [`GraniteForDoclingModel`].
+
+    shared_intermediate_size (`int`, *optional*, defaults to 1024):
+        Intermediate size of the shared MLP (`shared_mlp`) in each decoder layer.
+    position_embedding_type (`str`, *optional*, defaults to `"rope"`):
+        Positional embedding type. Supported: `"rope"`.
+    rswa_window (`int`, *optional*, defaults to `0`):
+        Reference Sliding Window Attention window size for decode tokens. When `> 0`,
+        serving stacks may apply R-SWA (see "Unlimited OCR Works",
+        https://huggingface.co/papers/2606.23050). Unused by the Transformers forward.
+    rswa_anchor_mode (`str`, *optional*, defaults to `"none"`):
+        `"none"` for plain R-SWA, or `"grammar"` for DocLang grammar anchors (RSWAG).
+    rswa_hybrid_period (`int`, *optional*, defaults to `0`):
+        When `> 0`, every N-th decoder layer keeps full attention.
+    rswa_full_attn_layers (`list[int]`, *optional*):
+        Explicit decoder layer indices that keep full attention (overrides
+        `rswa_hybrid_period` when provided).
     """
 
     model_type = "granite_for_docling_text"

@@ -104,6 +104,12 @@ class GraniteForDoclingTextConfig(PretrainedConfig):
     attention_multiplier: float | int | None = 1.0
     shared_intermediate_size: int = 1024
     position_embedding_type: str = "rope"
+    # Serving metadata for Reference Sliding Window Attention ("Unlimited OCR Works",
+    # https://huggingface.co/papers/2606.23050). Unused by the Transformers forward.
+    rswa_window: int = 0
+    rswa_anchor_mode: str = "none"
+    rswa_hybrid_period: int = 0
+    rswa_full_attn_layers: list[int] | None = None
 
     def __post_init__(self, **kwargs):
         if self.num_key_value_heads is None:
@@ -137,6 +143,18 @@ class GraniteForDoclingConfig(PretrainedConfig):
             `deepstack_attn_layers[i]`.
         deepstack_attn_layers (`list[int]`, *optional*, defaults to `[0, 1, 2]`):
             Text decoder layer indices that receive the corresponding DeepStack visual tap.
+        rswa_window (`int`, *optional*, defaults to `0`):
+            Reference Sliding Window Attention window size for decode tokens. When `> 0`,
+            serving stacks may apply R-SWA (see "Unlimited OCR Works",
+            https://huggingface.co/papers/2606.23050). Unused by the Transformers forward.
+        rswa_anchor_mode (`str`, *optional*, defaults to `"none"`):
+            `"none"` for plain R-SWA, or `"grammar"` for DocLang grammar anchors (RSWAG).
+        rswa_hybrid_period (`int`, *optional*, defaults to `0`):
+            When `> 0`, every N-th decoder layer keeps full attention. The full-attention
+            layer set must match the schedule the weights were trained with.
+        rswa_full_attn_layers (`list[int]`, *optional*):
+            Explicit decoder layer indices that keep full attention (overrides
+            `rswa_hybrid_period` when provided).
     """
 
     model_type = "granite_for_docling"
@@ -153,6 +171,10 @@ class GraniteForDoclingConfig(PretrainedConfig):
         use_deepstack=True,
         deepstack_visual_indexes=None,
         deepstack_attn_layers=None,
+        rswa_window=0,
+        rswa_anchor_mode="none",
+        rswa_hybrid_period=0,
+        rswa_full_attn_layers=None,
         **kwargs,
     ):
         self.image_token_id = image_token_id
@@ -192,6 +214,16 @@ class GraniteForDoclingConfig(PretrainedConfig):
                 "deepstack_visual_indexes and deepstack_attn_layers must have the same length "
                 f"(got {len(self.deepstack_visual_indexes)} vs {len(self.deepstack_attn_layers)})."
             )
+
+        self.rswa_window = int(rswa_window or 0)
+        self.rswa_anchor_mode = rswa_anchor_mode or "none"
+        self.rswa_hybrid_period = int(rswa_hybrid_period or 0)
+        self.rswa_full_attn_layers = list(rswa_full_attn_layers) if rswa_full_attn_layers is not None else None
+        # Mirror onto text_config so serving stacks that read the decoder config see them.
+        self.text_config.rswa_window = self.rswa_window
+        self.text_config.rswa_anchor_mode = self.rswa_anchor_mode
+        self.text_config.rswa_hybrid_period = self.rswa_hybrid_period
+        self.text_config.rswa_full_attn_layers = self.rswa_full_attn_layers
 
         super().__init__(**kwargs, tie_word_embeddings=tie_word_embeddings)
 

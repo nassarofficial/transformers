@@ -37,7 +37,6 @@ from ...utils.generic import merge_with_config_defaults
 from ...utils.output_capturing import capture_outputs
 from ..auto import CONFIG_MAPPING
 from ..granitemoehybrid.modeling_granitemoehybrid import (
-    GraniteFlashAttentionKwargs,
     GraniteMoeHybridAttention,
     GraniteMoeHybridMLP,
     GraniteMoeHybridRotaryEmbedding,
@@ -228,6 +227,11 @@ class GraniteForDoclingVisionConfig(Idefics3VisionConfig):
 class GraniteForDoclingTextConfig(PretrainedConfig):
     r"""
     Configuration for the dense Granite-style text decoder used in [`GraniteForDoclingModel`].
+
+    shared_intermediate_size (`int`, *optional*, defaults to 1024):
+        Intermediate size of the shared MLP (`shared_mlp`) in each decoder layer.
+    position_embedding_type (`str`, *optional*, defaults to `"rope"`):
+        Positional embedding type. Supported: `"rope"`.
     """
 
     model_type = "granite_for_docling_text"
@@ -681,7 +685,7 @@ class GraniteForDoclingTextDecoderLayer(GradientCheckpointingLayer):
         past_key_values: Cache | None = None,
         use_cache: bool | None = False,
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
-        **kwargs: Unpack[GraniteFlashAttentionKwargs],
+        **kwargs: Unpack[FlashAttentionKwargs],
     ) -> torch.FloatTensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -736,7 +740,7 @@ class GraniteForDoclingTextModel(GraniteForDoclingTextPreTrainedModel):
         visual_pos_masks: torch.Tensor | None = None,
         deepstack_visual_embeds: list[torch.Tensor] | None = None,
         deepstack_attn_layers: list[int] | None = None,
-        **kwargs: Unpack[GraniteFlashAttentionKwargs],
+        **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple | BaseModelOutputWithPast:
         r"""
         visual_pos_masks (`torch.Tensor` of shape `(batch_size, seq_len)`, *optional*):

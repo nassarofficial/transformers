@@ -74,6 +74,11 @@ class GraniteForDoclingVisionConfig(PreTrainedConfig):
 class GraniteForDoclingTextConfig(PretrainedConfig):
     r"""
     Configuration for the dense Granite-style text decoder used in [`GraniteForDoclingModel`].
+
+    shared_intermediate_size (`int`, *optional*, defaults to 1024):
+        Intermediate size of the shared MLP (`shared_mlp`) in each decoder layer.
+    position_embedding_type (`str`, *optional*, defaults to `"rope"`):
+        Positional embedding type. Supported: `"rope"`.
     """
 
     model_type = "granite_for_docling_text"

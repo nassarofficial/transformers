@@ -132,7 +132,7 @@ class GraniteForDoclingTextDecoderLayer(GradientCheckpointingLayer):
         past_key_values: Cache | None = None,
         use_cache: bool | None = False,
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
-        **kwargs: Unpack[GraniteFlashAttentionKwargs],
+        **kwargs: Unpack[FlashAttentionKwargs],
     ) -> torch.FloatTensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
@@ -185,7 +185,7 @@ class GraniteForDoclingTextModel(GraniteForDoclingTextPreTrainedModel):
         visual_pos_masks: torch.Tensor | None = None,
         deepstack_visual_embeds: list[torch.Tensor] | None = None,
         deepstack_attn_layers: list[int] | None = None,
-        **kwargs: Unpack[GraniteFlashAttentionKwargs],
+        **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple | BaseModelOutputWithPast:
         r"""
         visual_pos_masks (`torch.Tensor` of shape `(batch_size, seq_len)`, *optional*):

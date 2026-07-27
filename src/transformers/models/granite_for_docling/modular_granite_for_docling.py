@@ -699,6 +699,22 @@ class GraniteForDoclingCausalLMOutputWithPast(Idefics3CausalLMOutputWithPast):
     pass
 
 
+class GraniteForDoclingTextRMSNorm(GraniteMoeSharedRMSNorm):
+    pass
+
+
+class GraniteForDoclingTextAttention(GraniteMoeHybridAttention):
+    pass
+
+
+class GraniteForDoclingTextMLP(GraniteMoeHybridMLP):
+    pass
+
+
+class GraniteForDoclingTextRotaryEmbedding(GraniteMoeHybridRotaryEmbedding):
+    pass
+
+
 class GraniteForDoclingTextPreTrainedModel(PreTrainedModel):
     config_class = GraniteForDoclingTextConfig
     base_model_prefix = "model"
@@ -717,10 +733,10 @@ class GraniteForDoclingTextDecoderLayer(GradientCheckpointingLayer):
     def __init__(self, config: GraniteForDoclingTextConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.self_attn = GraniteMoeHybridAttention(config, layer_idx)
-        self.input_layernorm = GraniteMoeSharedRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = GraniteMoeSharedRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.shared_mlp = GraniteMoeHybridMLP(config)
+        self.self_attn = GraniteForDoclingTextAttention(config, layer_idx)
+        self.input_layernorm = GraniteForDoclingTextRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = GraniteForDoclingTextRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.shared_mlp = GraniteForDoclingTextMLP(config)
         self.residual_multiplier = config.residual_multiplier
 
     def forward(
@@ -762,9 +778,9 @@ class GraniteForDoclingTextModel(GraniteForDoclingTextPreTrainedModel):
         self.layers = nn.ModuleList(
             [GraniteForDoclingTextDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
-        self.norm = GraniteMoeSharedRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = GraniteForDoclingTextRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = (
-            GraniteMoeHybridRotaryEmbedding(config) if config.position_embedding_type == "rope" else None
+            GraniteForDoclingTextRotaryEmbedding(config) if config.position_embedding_type == "rope" else None
         )
         self.embedding_multiplier = config.embedding_multiplier
         self.post_init()

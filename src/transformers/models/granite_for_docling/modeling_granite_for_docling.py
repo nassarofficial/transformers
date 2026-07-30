@@ -423,6 +423,7 @@ class GraniteForDoclingTextModel(GraniteForDoclingTextPreTrainedModel):
             GraniteForDoclingTextRotaryEmbedding(config) if config.position_embedding_type == "rope" else None
         )
         self.embedding_multiplier = config.embedding_multiplier
+        self.gradient_checkpointing = False
         self.post_init()
 
     def get_input_embeddings(self):

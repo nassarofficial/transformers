@@ -423,6 +423,7 @@ class GraniteForDoclingTextModel(GraniteForDoclingTextPreTrainedModel):
             GraniteForDoclingTextRotaryEmbedding(config) if config.position_embedding_type == "rope" else None
         )
         self.embedding_multiplier = config.embedding_multiplier
+        self.gradient_checkpointing = False
         self.post_init()
 
     def get_input_embeddings(self):
@@ -1084,6 +1085,7 @@ class GraniteForDoclingModel(GraniteForDoclingPreTrainedModel):
 
         return image_outputs
 
+    @merge_with_config_defaults
     @can_return_tuple
     @auto_docstring
     def forward(
@@ -1097,8 +1099,6 @@ class GraniteForDoclingModel(GraniteForDoclingPreTrainedModel):
         pixel_attention_mask: torch.BoolTensor | None = None,
         image_hidden_states: torch.FloatTensor | None = None,
         use_cache: bool | None = None,
-        output_attentions: bool | None = None,
-        output_hidden_states: bool | None = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple | GraniteForDoclingBaseModelOutputWithPast:
         r"""
@@ -1107,15 +1107,6 @@ class GraniteForDoclingModel(GraniteForDoclingPreTrainedModel):
         image_hidden_states (`torch.FloatTensor` of shape `(batch_size, num_channels, image_size, image_size)`):
             The hidden states of the image encoder after modality projection.
         """
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        )
-        use_cache = use_cache if use_cache is not None else self.config.use_cache
-
-        if self.training and self.text_model.gradient_checkpointing and use_cache:
-            use_cache = False
-
         if inputs_embeds is None:
             inputs_embeds = self.text_model.get_input_embeddings()(input_ids).to(self.device)
 
@@ -1155,8 +1146,6 @@ class GraniteForDoclingModel(GraniteForDoclingPreTrainedModel):
             position_ids=position_ids,
             past_key_values=past_key_values,
             use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
             **deepstack_kwargs,
             **kwargs,
         )
@@ -1227,8 +1216,6 @@ class GraniteForDoclingForConditionalGeneration(GraniteForDoclingPreTrainedModel
         image_hidden_states: torch.FloatTensor | None = None,
         labels: torch.LongTensor | None = None,
         use_cache: bool | None = None,
-        output_attentions: bool | None = None,
-        output_hidden_states: bool | None = None,
         logits_to_keep: int | torch.Tensor = 0,
         **kwargs: Unpack[TransformersKwargs],
     ) -> tuple | GraniteForDoclingCausalLMOutputWithPast:
@@ -1295,11 +1282,6 @@ class GraniteForDoclingForConditionalGeneration(GraniteForDoclingPreTrainedModel
         >>> print(generated_texts[1])
         Assistant: The bridge is in San Francisco.
         ```"""
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
-        output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
-        )
-
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -1310,8 +1292,6 @@ class GraniteForDoclingForConditionalGeneration(GraniteForDoclingPreTrainedModel
             pixel_attention_mask=pixel_attention_mask,
             image_hidden_states=image_hidden_states,
             use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
             **kwargs,
         )
 

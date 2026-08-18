@@ -134,6 +134,11 @@ class GraniteForDoclingConfig(PretrainedConfig):
             The scale factor for the image encoder projector.
         mp_pooling_mode (`str`, *optional*, defaults to `"pixel_shuffle_mlp_v2"`):
             Modality-projector variant. Supported: `"pixel_shuffle"`, `"pixel_shuffle_mlp_v2"`.
+        mp_adaptive_input_mode (`str`, *optional*, defaults to `"none"`):
+            `"token_rate"` adds the dense-page fine projector path: tiles flagged fine are pixel-shuffled
+            at `scale_factor / 2` through `connector.proj_fine`, emitting 4x tokens per tile. The prompt
+            must reserve the matching placeholder count per tile — the route is decided BEFORE the forward
+            (by the processor / caller); the model only follows the per-tile mask it is handed.
         use_deepstack (`bool`, *optional*, defaults to `True`):
             Whether to inject intermediate ViT features into selected decoder layers at image-token
             positions.
@@ -155,6 +160,7 @@ class GraniteForDoclingConfig(PretrainedConfig):
         text_config=None,
         scale_factor=4,
         mp_pooling_mode="pixel_shuffle_mlp_v2",
+        mp_adaptive_input_mode="none",
         use_deepstack=True,
         deepstack_visual_indexes=None,
         deepstack_attn_layers=None,
@@ -186,6 +192,17 @@ class GraniteForDoclingConfig(PretrainedConfig):
                 f"Unknown mp_pooling_mode={mp_pooling_mode!r}. Supported: 'pixel_shuffle', 'pixel_shuffle_mlp_v2'."
             )
         self.mp_pooling_mode = mp_pooling_mode
+
+        if mp_adaptive_input_mode not in ("none", "token_rate"):
+            raise ValueError(
+                f"Unknown mp_adaptive_input_mode={mp_adaptive_input_mode!r}. Supported: 'none', 'token_rate'."
+            )
+        if mp_adaptive_input_mode == "token_rate":
+            if mp_pooling_mode != "pixel_shuffle_mlp_v2":
+                raise ValueError("mp_adaptive_input_mode='token_rate' requires mp_pooling_mode='pixel_shuffle_mlp_v2'.")
+            if scale_factor % 2:
+                raise ValueError("mp_adaptive_input_mode='token_rate' requires an even scale_factor.")
+        self.mp_adaptive_input_mode = mp_adaptive_input_mode
 
         self.use_deepstack = use_deepstack
         self.deepstack_visual_indexes = (

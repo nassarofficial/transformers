@@ -652,6 +652,40 @@ class GraniteForDoclingConnector(nn.Module):
                 ]
             )
 
+        # ---- token_rate fine path (mp_adaptive_input_mode="token_rate") ----
+        # Dense tiles pixel-shuffle at scale_factor/2 through ``proj_fine``
+        # (4x tokens per tile); ln_mid / mlp_fc2 / ln_out are SHARED with the
+        # pretrained coarse path. Mirrors nanovlm ModalityProjector exactly —
+        # weight names line up 1:1 with the converter's key table.
+        self.adaptive_token_rate = getattr(config, "mp_adaptive_input_mode", "none") == "token_rate"
+        self.proj_fine: nn.Linear | None = None
+        self.deepstack_mergers_fine: nn.ModuleList | None = None
+        if self.adaptive_token_rate:
+            self.fine_scale = self.scale_factor // 2
+            self.proj_fine = nn.Linear(
+                vision_hidden_size * (self.fine_scale**2),
+                text_hidden_size,
+                bias=False,
+            )
+            fine_tokens_per_tile = (
+                (config.vision_config.image_size // config.vision_config.patch_size) ** 2
+                // (self.fine_scale**2)
+            )
+            fine_grid = int(fine_tokens_per_tile**0.5)
+            pos_embed_fine = _build_2d_sincos_pos_embed(text_hidden_size, fine_grid)
+            self.register_buffer("pos_embed_2d_fine", pos_embed_fine, persistent=False)
+            if self.deepstack_mergers is not None:
+                self.deepstack_mergers_fine = nn.ModuleList(
+                    [
+                        GraniteForDoclingDeepStackMerger(
+                            config.vision_config.hidden_size,
+                            self.fine_scale,
+                            config.text_config.hidden_size,
+                        )
+                        for _ in config.deepstack_visual_indexes
+                    ]
+                )
+
     def pixel_shuffle(self, x, scale_factor=2):
         bsz, seq, embed_dim = x.size()
         height = width = int(seq**0.5)
@@ -663,7 +697,57 @@ class GraniteForDoclingConnector(nn.Module):
         x = x.reshape(bsz, int(seq / (scale_factor**2)), embed_dim * (scale_factor**2))
         return x
 
-    def forward(self, image_hidden_states):
+    def _forward_fine(self, image_hidden_states):
+        """Fine-rate path for token_rate: shuffle at scale_factor/2 through
+        ``proj_fine``; every text-hidden-side module is shared with the coarse
+        path. Only valid for ``pixel_shuffle_mlp_v2``."""
+        x = self.ln_in(image_hidden_states)
+        x = self.pixel_shuffle(x, self.fine_scale)
+        x = self.proj_fine(x)
+        x = x + self.pos_embed_2d_fine.to(dtype=x.dtype)
+        x = self.ln_mid(x)
+        x = nn.functional.gelu(x)
+        x = self.mlp_fc2(x)
+        x = self.ln_out(x)
+        return x
+
+    def forward(self, image_hidden_states, tile_fine_mask=None):
+        """``tile_fine_mask``: optional ``[num_tiles]`` bool. Tiles marked True
+        take the fine path (4x tokens); the output is then FLAT
+        ``[sum(tokens_i), hidden]`` in original tile order, matching the
+        placeholder counts the processor wrote per tile. ``None`` (default)
+        preserves the historical behavior bit-for-bit. The mask is an input,
+        never inferred here: routing is decided before the forward, by whoever
+        built the prompt."""
+        if (
+            tile_fine_mask is not None
+            and self.adaptive_token_rate
+            and bool(tile_fine_mask.any())
+        ):
+            mask = tile_fine_mask.to(dtype=torch.bool, device=image_hidden_states.device)
+            if int(mask.numel()) != int(image_hidden_states.shape[0]):
+                raise ValueError(
+                    f"tile_fine_mask has {int(mask.numel())} entries for "
+                    f"{int(image_hidden_states.shape[0])} tiles."
+                )
+            coarse_out = fine_out = None
+            if bool((~mask).any()):
+                coarse_out = self._forward_coarse(image_hidden_states[~mask])
+            fine_out = self._forward_fine(image_hidden_states[mask])
+            hidden = fine_out.shape[-1]
+            pieces = []
+            ci = fi = 0
+            for is_fine in mask.tolist():
+                if is_fine:
+                    pieces.append(fine_out[fi])
+                    fi += 1
+                else:
+                    pieces.append(coarse_out[ci])
+                    ci += 1
+            return torch.cat([p.reshape(-1, hidden) for p in pieces], dim=0)
+        return self._forward_coarse(image_hidden_states)
+
+    def _forward_coarse(self, image_hidden_states):
         if self.pooling_mode == "pixel_shuffle":
             x = self.pixel_shuffle(image_hidden_states, self.scale_factor)
             return self.modality_projection(x)
@@ -1034,12 +1118,18 @@ class GraniteForDoclingModel(GraniteForDoclingPreTrainedModel):
         self,
         pixel_values: torch.FloatTensor,
         pixel_attention_mask=None,
+        tile_fine_mask=None,
         **kwargs,
     ) -> tuple | BaseModelOutputWithPooling:
         r"""
         pixel_attention_mask (`torch.BoolTensor`, *optional*):
             Unused. GotOcr2ImageProcessor crops each tile to exactly the ViT input
             resolution, so every pixel is real. Kept for API compatibility only.
+        tile_fine_mask (`torch.BoolTensor` of shape `[num_real_tiles]`, *optional*):
+            token_rate routing. Tiles marked True project through the fine path
+            (4x tokens/tile); the connector output is then flat in tile order.
+            The caller (processor / serving layer) decides the route and must
+            have written the matching per-tile placeholder counts.
         """
         batch_size, num_images, num_channels, height, width = pixel_values.shape
         pixel_values = pixel_values.view(batch_size * num_images, *pixel_values.shape[2:])
@@ -1071,15 +1161,48 @@ class GraniteForDoclingModel(GraniteForDoclingPreTrainedModel):
             pixel_values=pixel_values, patch_attention_mask=None, return_dict=True, **kwargs
         )
         image_hidden_states = image_outputs.last_hidden_state
-        image_features = self.connector(image_hidden_states)
+        image_features = self.connector(image_hidden_states, tile_fine_mask=tile_fine_mask)
         image_outputs.pooler_output = image_features
 
         if deepstack_enabled and image_outputs.hidden_states is not None:
             ds_indexes = self.config.deepstack_visual_indexes
-            image_outputs.deepstack_features = [
-                self.connector.deepstack_mergers[slot](image_outputs.hidden_states[layer_idx])
-                for slot, layer_idx in enumerate(ds_indexes)
-            ]
+            _routing = (
+                tile_fine_mask is not None
+                and getattr(self.connector, "adaptive_token_rate", False)
+                and bool(tile_fine_mask.any())
+                and self.connector.deepstack_mergers_fine is not None
+            )
+            if _routing:
+                # Per-tile fine/coarse merger routing, reassembled flat in tile
+                # order — must mirror the connector's layout exactly, since both
+                # scatter into the same placeholder positions.
+                mask = tile_fine_mask.to(dtype=torch.bool, device=image_hidden_states.device)
+                feats = []
+                for slot, layer_idx in enumerate(ds_indexes):
+                    tap = image_outputs.hidden_states[layer_idx]
+                    coarse = (
+                        self.connector.deepstack_mergers[slot](tap[~mask])
+                        if bool((~mask).any())
+                        else None
+                    )
+                    fine = self.connector.deepstack_mergers_fine[slot](tap[mask])
+                    hidden = fine.shape[-1]
+                    pieces = []
+                    ci = fi = 0
+                    for is_fine in mask.tolist():
+                        if is_fine:
+                            pieces.append(fine[fi])
+                            fi += 1
+                        else:
+                            pieces.append(coarse[ci])
+                            ci += 1
+                    feats.append(torch.cat([p.reshape(-1, hidden) for p in pieces], dim=0))
+                image_outputs.deepstack_features = feats
+            else:
+                image_outputs.deepstack_features = [
+                    self.connector.deepstack_mergers[slot](image_outputs.hidden_states[layer_idx])
+                    for slot, layer_idx in enumerate(ds_indexes)
+                ]
         else:
             image_outputs.deepstack_features = None
 

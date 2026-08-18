@@ -557,6 +557,18 @@ class GraniteForDoclingPreTrainedModel(PreTrainedModel):
                 module.pos_embed_2d.shape[-1], int(module.pos_embed_2d.shape[0] ** 0.5)
             )
             module.pos_embed_2d.data.copy_(pos_embed.to(module.pos_embed_2d.device))
+            # Non-persistent buffers are NOT in the checkpoint: after
+            # meta-device loading they hold uninitialized memory unless
+            # recomputed here. Forgetting the fine buffer produced NaN outputs
+            # on the fine path while coarse stayed perfect.
+            if getattr(module, "adaptive_token_rate", False) and hasattr(module, "pos_embed_2d_fine"):
+                pos_embed_fine = _build_2d_sincos_pos_embed(
+                    module.pos_embed_2d_fine.shape[-1],
+                    int(module.pos_embed_2d_fine.shape[0] ** 0.5),
+                )
+                module.pos_embed_2d_fine.data.copy_(
+                    pos_embed_fine.to(module.pos_embed_2d_fine.device)
+                )
 
 
 class GraniteForDoclingDeepStackMerger(nn.Module):

@@ -1311,6 +1311,10 @@ class GraniteForDoclingForConditionalGeneration(GraniteForDoclingPreTrainedModel
         self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
         self.vocab_size = config.text_config.vocab_size
 
+        from .modeling_granite_for_docling_mtp import maybe_build_mtp
+
+        self.mtp = maybe_build_mtp(config)
+
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -1442,6 +1446,18 @@ class GraniteForDoclingForConditionalGeneration(GraniteForDoclingPreTrainedModel
             loss = self.loss_function(
                 logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size, **kwargs
             )
+            if self.mtp is not None and hidden_states.size(1) == labels.size(1):
+                embed_fn = self.model.text_model.get_input_embeddings()
+                logits_scaling = getattr(self.config.text_config, "logits_scaling", 1) or 1
+                mtp_loss, _, _ = self.mtp.compute_loss(
+                    hidden_states,
+                    labels,
+                    embed_fn,
+                    self.lm_head,
+                    logits_scaling=logits_scaling,
+                    attention_mask=attention_mask,
+                )
+                loss = loss + self.mtp.loss_weight * mtp_loss
 
         return GraniteForDoclingCausalLMOutputWithPast(
             loss=loss,
@@ -1489,5 +1505,33 @@ class GraniteForDoclingForConditionalGeneration(GraniteForDoclingPreTrainedModel
 
         return model_inputs
 
+    def generate(self, inputs=None, use_speculative=None, **kwargs):
+        if use_speculative is None:
+            use_speculative = bool(getattr(self.config, "mtp_use_speculative", False))
+        if use_speculative and getattr(self, "mtp", None) is not None:
+            from .modeling_granite_for_docling_mtp import generate_speculative
 
-__all__ = ["GraniteForDoclingForConditionalGeneration", "GraniteForDoclingModel", "GraniteForDoclingPreTrainedModel"]
+            input_ids = kwargs.pop("input_ids", inputs)
+            max_new_tokens = kwargs.pop("max_new_tokens", 32)
+            eos_token_id = kwargs.pop("eos_token_id", getattr(self.config, "eos_token_id", None))
+            if eos_token_id is None:
+                eos_token_id = getattr(self.generation_config, "eos_token_id", None)
+            for drop in ("do_sample", "temperature", "generation_config"):
+                kwargs.pop(drop, None)
+            return generate_speculative(
+                self,
+                input_ids,
+                max_new_tokens=max_new_tokens,
+                eos_token_id=eos_token_id,
+                **kwargs,
+            )
+        if inputs is None:
+            return super().generate(**kwargs)
+        return super().generate(inputs, **kwargs)
+
+
+__all__ = [
+    "GraniteForDoclingForConditionalGeneration",
+    "GraniteForDoclingModel",
+    "GraniteForDoclingPreTrainedModel",
+]

@@ -295,6 +295,24 @@ class GraniteForDoclingConfig(PretrainedConfig):
             `deepstack_attn_layers[i]`.
         deepstack_attn_layers (`list[int]`, *optional*, defaults to `[0, 1, 2]`):
             Text decoder layer indices that receive the corresponding DeepStack visual tap.
+        use_mtp (`bool`, *optional*, defaults to `False`):
+            Attach optional Multi-Token Prediction draft heads. Off by default.
+        mtp_num_heads (`int`, *optional*, defaults to `0`):
+            Number of MTP heads (K).
+        mtp_weight (`float`, *optional*, defaults to `0.3`):
+            Weight of the mean MTP CE relative to the main LM loss.
+        mtp_loss_chunk_size (`int`, *optional*, defaults to `1024`):
+            Sequence chunk size for per-head CE.
+        mtp_num_heads_attn (`int`, *optional*):
+            Attention heads inside each MTP block.
+        mtp_ffn_dim (`int`, *optional*):
+            FFN width of each MTP block.
+        mtp_dropout (`float`, *optional*, defaults to `0.0`):
+            Dropout inside the MTP encoder layer.
+        mtp_use_speculative (`bool`, *optional*, defaults to `False`):
+            Default `generate(..., use_speculative=...)` to the MTP draft loop.
+        mtp_draft_vocab_file (`str`, *optional*):
+            Optional frequency-ranked draft vocabulary JSON (relative to the model dir).
     """
 
     model_type = "granite_for_docling"
@@ -311,6 +329,15 @@ class GraniteForDoclingConfig(PretrainedConfig):
         use_deepstack=True,
         deepstack_visual_indexes=None,
         deepstack_attn_layers=None,
+        use_mtp=False,
+        mtp_num_heads=0,
+        mtp_weight=0.3,
+        mtp_loss_chunk_size=1024,
+        mtp_num_heads_attn=None,
+        mtp_ffn_dim=None,
+        mtp_dropout=0.0,
+        mtp_use_speculative=False,
+        mtp_draft_vocab_file=None,
         **kwargs,
     ):
         self.image_token_id = image_token_id
@@ -352,6 +379,20 @@ class GraniteForDoclingConfig(PretrainedConfig):
                 "deepstack_visual_indexes and deepstack_attn_layers must have the same length "
                 f"(got {len(self.deepstack_visual_indexes)} vs {len(self.deepstack_attn_layers)})."
             )
+
+        self.use_mtp = bool(use_mtp)
+        self.mtp_num_heads = int(mtp_num_heads or 0)
+        self.mtp_weight = float(mtp_weight)
+        self.mtp_loss_chunk_size = int(mtp_loss_chunk_size or 0)
+        self.mtp_num_heads_attn = (
+            int(mtp_num_heads_attn) if mtp_num_heads_attn is not None else None
+        )
+        self.mtp_ffn_dim = int(mtp_ffn_dim) if mtp_ffn_dim is not None else None
+        self.mtp_dropout = float(mtp_dropout or 0.0)
+        self.mtp_use_speculative = bool(mtp_use_speculative)
+        self.mtp_draft_vocab_file = mtp_draft_vocab_file
+        if self.use_mtp and self.mtp_num_heads <= 0:
+            raise ValueError("use_mtp=True requires mtp_num_heads > 0")
 
         super().__init__(**kwargs, tie_word_embeddings=tie_word_embeddings)
 
@@ -1105,6 +1146,12 @@ class GraniteForDoclingModel(Idefics3Model):
 class GraniteForDoclingForConditionalGeneration(Idefics3ForConditionalGeneration):
     config_class = GraniteForDoclingConfig
 
+    def __init__(self, config):
+        super().__init__(config)
+        from .modeling_granite_for_docling_mtp import maybe_build_mtp
+
+        self.mtp = maybe_build_mtp(config)
+
     @can_return_tuple
     @auto_docstring
     def forward(
@@ -1147,6 +1194,19 @@ class GraniteForDoclingForConditionalGeneration(Idefics3ForConditionalGeneration
             loss = self.loss_function(
                 logits=logits, labels=labels, vocab_size=self.config.text_config.vocab_size, **kwargs
             )
+            mtp = getattr(self, "mtp", None)
+            if mtp is not None and hidden_states.size(1) == labels.size(1):
+                embed_fn = self.model.text_model.get_input_embeddings()
+                logits_scaling = getattr(self.config.text_config, "logits_scaling", 1) or 1
+                mtp_loss, _, _ = mtp.compute_loss(
+                    hidden_states,
+                    labels,
+                    embed_fn,
+                    self.lm_head,
+                    logits_scaling=logits_scaling,
+                    attention_mask=attention_mask,
+                )
+                loss = loss + mtp.loss_weight * mtp_loss
 
         return GraniteForDoclingCausalLMOutputWithPast(
             loss=loss,
@@ -1156,6 +1216,31 @@ class GraniteForDoclingForConditionalGeneration(Idefics3ForConditionalGeneration
             attentions=outputs.attentions,
             image_hidden_states=outputs.image_hidden_states,
         )
+
+
+    def generate(self, inputs=None, use_speculative=None, **kwargs):
+        if use_speculative is None:
+            use_speculative = bool(getattr(self.config, "mtp_use_speculative", False))
+        if use_speculative and getattr(self, "mtp", None) is not None:
+            from .modeling_granite_for_docling_mtp import generate_speculative
+
+            input_ids = kwargs.pop("input_ids", inputs)
+            max_new_tokens = kwargs.pop("max_new_tokens", 32)
+            eos_token_id = kwargs.pop("eos_token_id", getattr(self.config, "eos_token_id", None))
+            if eos_token_id is None:
+                eos_token_id = getattr(self.generation_config, "eos_token_id", None)
+            for drop in ("do_sample", "temperature", "generation_config"):
+                kwargs.pop(drop, None)
+            return generate_speculative(
+                self,
+                input_ids,
+                max_new_tokens=max_new_tokens,
+                eos_token_id=eos_token_id,
+                **kwargs,
+            )
+        if inputs is None:
+            return super().generate(**kwargs)
+        return super().generate(inputs, **kwargs)
 
 
 __all__ = [

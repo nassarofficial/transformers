@@ -147,6 +147,28 @@ class GraniteForDoclingConfig(PretrainedConfig):
             `deepstack_attn_layers[i]`.
         deepstack_attn_layers (`list[int]`, *optional*, defaults to `[0, 1, 2]`):
             Text decoder layer indices that receive the corresponding DeepStack visual tap.
+        use_mtp (`bool`, *optional*, defaults to `False`):
+            Attach optional Multi-Token Prediction draft heads for speculative decoding.
+            Off by default; existing checkpoints are unchanged.
+        mtp_num_heads (`int`, *optional*, defaults to `0`):
+            Number of MTP heads (K). Head `i` predicts token t+2+i.
+        mtp_weight (`float`, *optional*, defaults to `0.3`):
+            Weight of the mean MTP CE relative to the main LM loss when labels are passed.
+        mtp_loss_chunk_size (`int`, *optional*, defaults to `1024`):
+            Sequence chunk size for per-head CE (bounds the fp32 logits buffer).
+        mtp_num_heads_attn (`int`, *optional*):
+            Attention heads inside each MTP block. Defaults to the decoder's `num_attention_heads`.
+        mtp_ffn_dim (`int`, *optional*):
+            FFN width of each MTP block. Defaults to the decoder's `intermediate_size`.
+        mtp_dropout (`float`, *optional*, defaults to `0.0`):
+            Dropout inside the MTP `TransformerEncoderLayer`.
+        mtp_use_speculative (`bool`, *optional*, defaults to `False`):
+            When True, `generate(..., use_speculative=True)` (the default if this flag is set)
+            runs greedy speculative decoding with the MTP heads.
+        mtp_draft_vocab_file (`str`, *optional*):
+            Optional frequency-ranked draft vocabulary JSON (relative to the model dir).
+            The draft argmax is restricted to those rows; the target still verifies the
+            full vocab so decoding stays lossless.
     """
 
     model_type = "granite_for_docling"
@@ -164,6 +186,15 @@ class GraniteForDoclingConfig(PretrainedConfig):
         use_deepstack=True,
         deepstack_visual_indexes=None,
         deepstack_attn_layers=None,
+        use_mtp=False,
+        mtp_num_heads=0,
+        mtp_weight=0.3,
+        mtp_loss_chunk_size=1024,
+        mtp_num_heads_attn=None,
+        mtp_ffn_dim=None,
+        mtp_dropout=0.0,
+        mtp_use_speculative=False,
+        mtp_draft_vocab_file=None,
         **kwargs,
     ):
         self.image_token_id = image_token_id
@@ -214,6 +245,20 @@ class GraniteForDoclingConfig(PretrainedConfig):
                 "deepstack_visual_indexes and deepstack_attn_layers must have the same length "
                 f"(got {len(self.deepstack_visual_indexes)} vs {len(self.deepstack_attn_layers)})."
             )
+
+        self.use_mtp = bool(use_mtp)
+        self.mtp_num_heads = int(mtp_num_heads or 0)
+        self.mtp_weight = float(mtp_weight)
+        self.mtp_loss_chunk_size = int(mtp_loss_chunk_size or 0)
+        self.mtp_num_heads_attn = (
+            int(mtp_num_heads_attn) if mtp_num_heads_attn is not None else None
+        )
+        self.mtp_ffn_dim = int(mtp_ffn_dim) if mtp_ffn_dim is not None else None
+        self.mtp_dropout = float(mtp_dropout or 0.0)
+        self.mtp_use_speculative = bool(mtp_use_speculative)
+        self.mtp_draft_vocab_file = mtp_draft_vocab_file
+        if self.use_mtp and self.mtp_num_heads <= 0:
+            raise ValueError("use_mtp=True requires mtp_num_heads > 0")
 
         super().__init__(**kwargs, tie_word_embeddings=tie_word_embeddings)
 

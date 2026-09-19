@@ -295,6 +295,10 @@ class GraniteForDoclingProcessor(ProcessorMixin):
             uint8_kwargs["do_rescale"] = False
             uint8_kwargs["do_normalize"] = False
             image_inputs = self.image_processor(images, **uint8_kwargs)
+            # GraniteForDoclingImageProcessor also returns the tile grid; the model
+            # takes neither (this processor derives rows/cols itself for the prompt).
+            image_inputs.pop("rows", None)
+            image_inputs.pop("cols", None)
             pv = image_inputs.get("pixel_values")
             if pv is not None:
                 image_inputs["pixel_values"] = pv.to(dtype=torch.uint8)
